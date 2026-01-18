@@ -13,6 +13,9 @@
 .test
 .test2
 .vscode
+.history
+.test.dSYM
+.test2.dSYM
 afl-addseeds.8
 afl-analyze
 afl-analyze.8
