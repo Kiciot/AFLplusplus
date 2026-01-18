@@ -49,6 +49,9 @@ fsrv_run_result_t __attribute__((hot)) fuzz_run_target(afl_state_t      *afl,
                                                        afl_forkserver_t *fsrv,
                                                        u32 timeout) {
 
+  u64 exec_start_us = 0;
+  if (afl->bandit.enabled) { exec_start_us = get_cur_time_us(); }
+
 #ifdef PROFILING
   static u64      time_spent_start = 0;
   struct timespec spec;
@@ -64,6 +67,38 @@ fsrv_run_result_t __attribute__((hot)) fuzz_run_target(afl_state_t      *afl,
 #endif
 
   fsrv_run_result_t res = afl_fsrv_run_target(fsrv, timeout, &afl->stop_soon);
+
+  if (afl->bandit.enabled) {
+
+    u64 exec_us = get_cur_time_us() - exec_start_us;
+    if (unlikely(!exec_us)) { exec_us = 1; }
+    afl->bandit_last_exec_us = exec_us;
+    if (afl->bandit_exec_us_ema <= 0.0) {
+
+      afl->bandit_exec_us_ema = (double)exec_us;
+
+    } else {
+
+      afl->bandit_exec_us_ema =
+          0.99 * afl->bandit_exec_us_ema + 0.01 * (double)exec_us;
+
+    }
+
+    u64 avg_exec_us = 0;
+    if (afl->total_cal_cycles) {
+
+      avg_exec_us = afl->total_cal_us / afl->total_cal_cycles;
+
+    }
+
+    u8  timed_out = (res == FSRV_RUN_TMOUT) || fsrv->last_run_timed_out;
+    u8  slow_exec = avg_exec_us && exec_us > avg_exec_us * 3;
+    u64 timeouts = timed_out ? 1 : 0;
+    u64 slow_execs = slow_exec ? 1 : 0;
+
+    bandit_on_exec(&afl->bandit, 1, exec_us, timeouts, slow_execs);
+
+  }
 
 #ifdef __AFL_CODE_COVERAGE
   if (unlikely(!fsrv->persistent_trace_bits)) {
@@ -1513,4 +1548,3 @@ u8 __attribute__((hot)) common_fuzz_stuff(afl_state_t *afl, u8 *out_buf,
   return 0;
 
 }
-

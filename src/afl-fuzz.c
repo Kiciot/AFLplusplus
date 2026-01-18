@@ -100,7 +100,56 @@
   #define NZLIBREAD read
   #define ZLIBREAD ck_read
   #define ZLIBWRITE ck_write
-  #define ZLIBCLOSE close
+#define ZLIBCLOSE close
+#endif
+
+#ifndef _WIN32
+  #include <unistd.h>
+#endif
+
+#include <ctype.h>
+
+#ifndef _WIN32
+static void afl_set_build_id(afl_state_t *afl) {
+
+  if (!afl) { return; }
+  snprintf((char *)afl->build_id, sizeof(afl->build_id), "%s_%s", __DATE__,
+           __TIME__);
+
+  FILE *fp = popen("git rev-parse --short HEAD 2>/dev/null", "r");
+  if (fp) {
+
+    char buf[64] = {0};
+    if (fgets(buf, sizeof(buf), fp)) {
+
+      size_t len = strlen(buf);
+      while (len && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+
+        buf[--len] = 0;
+
+      }
+
+      if (len > 0) {
+
+        snprintf((char *)afl->build_id, sizeof(afl->build_id), "%s", buf);
+
+      }
+
+    }
+
+    pclose(fp);
+
+  }
+
+}
+#else
+static void afl_set_build_id(afl_state_t *afl) {
+
+  if (!afl) { return; }
+  snprintf((char *)afl->build_id, sizeof(afl->build_id), "%s_%s", __DATE__,
+           __TIME__);
+
+}
 #endif
 
 #ifdef __APPLE__
@@ -615,10 +664,238 @@ int main(int argc, char **argv_orig, char **envp) {
   if (get_afl_env("AFL_DEBUG")) { debug = afl->debug = 1; }
 
   afl_state_init(afl, map_size);
+  afl_set_build_id(afl);
   afl->debug = debug;
   afl_fsrv_init(&afl->fsrv);
   if (debug) { afl->fsrv.debug = true; }
   read_afl_environment(afl, envp);
+
+  /* Dict control defaults / env */
+  u32 dict_default = AFL_BANDIT_DICT_PROB_DEFAULT;
+  if (afl->afl_env.afl_bandit_dict_prob_default) {
+
+    dict_default = (u32)atoi((const char *)afl->afl_env.afl_bandit_dict_prob_default);
+    if (dict_default > 100) { dict_default = 100; }
+
+  }
+  afl->bandit_dict_prob = dict_default;
+  afl->bandit_dict_enable = 1;
+  if (afl->afl_env.afl_bandit_dict) {
+
+    const char *dict_env = (const char *)afl->afl_env.afl_bandit_dict;
+    afl->bandit_dict_enable =
+        (!dict_env[0] || atoi(dict_env) != 0) ? 1 : 0;
+
+  }
+
+  if (afl->afl_env.afl_bandit) {
+
+    const char *bandit_val = (const char *)afl->afl_env.afl_bandit;
+    u8          enable_bandit =
+        !bandit_val[0] || atoi(bandit_val) != 0 ? 1 : 0;
+
+    if (enable_bandit) {
+
+      u64 window_ms = AFL_BANDIT_DEFAULT_WINDOW_MS;
+
+      if (afl->afl_env.afl_bandit_window_ms) {
+
+        u64 parsed_window = strtoull(
+            (const char *)afl->afl_env.afl_bandit_window_ms, NULL, 10);
+        if (parsed_window) { window_ms = parsed_window; }
+
+      }
+
+      bandit_init(&afl->bandit, AFL_BANDIT_DEFAULT_ARMS, window_ms);
+      if (afl->afl_env.afl_bandit_reward) {
+
+        const char *reward =
+            (const char *)afl->afl_env.afl_bandit_reward;
+
+        if (!stricmp(reward, "event")) {
+
+          afl->bandit.reward_mode = BANDIT_REWARD_EVENT;
+
+        } else if (!stricmp(reward, "bits")) {
+
+          afl->bandit.reward_mode = BANDIT_REWARD_BITS;
+
+        } else if (!stricmp(reward, "rarity_mass")) {
+
+          afl->bandit.reward_mode = BANDIT_REWARD_RARITY_MASS;
+
+        } else {
+
+          afl->bandit.reward_mode = BANDIT_REWARD_NOVELTY;
+
+        }
+
+      }
+
+      if (afl->afl_env.afl_bandit_reward_formula) {
+
+        const char *formula =
+            (const char *)afl->afl_env.afl_bandit_reward_formula;
+
+        if (!stricmp(formula, "rate")) {
+
+          afl->bandit.reward_formula = BANDIT_REWARD_RATE;
+
+        } else {
+
+          afl->bandit.reward_formula = BANDIT_REWARD_RATE_COST;
+
+        }
+
+      }
+
+      if (afl->afl_env.afl_bandit_beta) {
+
+        afl->bandit.beta = atof((const char *)afl->afl_env.afl_bandit_beta);
+
+      }
+
+      if (afl->afl_env.afl_bandit_gamma) {
+
+        afl->bandit.gamma = atof((const char *)afl->afl_env.afl_bandit_gamma);
+
+      }
+
+      if (afl->afl_env.afl_bandit_temporal) {
+
+        const char *temporal =
+            (const char *)afl->afl_env.afl_bandit_temporal;
+        afl->bandit_temporal =
+            !temporal[0] || atoi(temporal) != 0 ? 1 : 0;
+
+      }
+
+      if (afl->afl_env.afl_bandit_lambda) {
+
+        afl->bandit_lambda = atof((const char *)afl->afl_env.afl_bandit_lambda);
+
+      }
+
+      if (afl->afl_env.afl_bandit_discount) {
+
+        double disc = atof((const char *)afl->afl_env.afl_bandit_discount);
+        if (disc > 1.0) { disc = 1.0; }
+        if (disc <= 0.0) { disc = 1.0; }
+        afl->bandit.discount = disc;
+
+      }
+
+      if (afl->afl_env.afl_bandit_warmup_windows) {
+
+        afl->bandit.warmup_windows =
+            strtoull((const char *)afl->afl_env.afl_bandit_warmup_windows, NULL,
+                     10);
+
+      }
+
+      if (afl->afl_env.afl_bandit_rarity_norm) {
+
+        const char *norm =
+            (const char *)afl->afl_env.afl_bandit_rarity_norm;
+        if (!stricmp(norm, "none")) {
+
+          afl->bandit.rarity_norm = BANDIT_RARITY_NORM_NONE;
+
+        } else {
+
+          afl->bandit.rarity_norm = BANDIT_RARITY_NORM_PATH_LEN;
+
+        }
+
+      }
+
+      if (afl->afl_env.afl_bandit_gate) {
+
+        const char *gate = (const char *)afl->afl_env.afl_bandit_gate;
+
+        if (!stricmp(gate, "none")) {
+
+          afl->bandit_gate = BANDIT_GATE_NONE;
+
+        } else if (!stricmp(gate, "path_len")) {
+
+          afl->bandit_gate = BANDIT_GATE_PATH_LEN;
+
+        } else {
+
+          afl->bandit_gate = BANDIT_GATE_EXEC_US;
+
+        }
+
+      }
+
+      if (afl->afl_env.afl_bandit_rho) {
+
+        afl->bandit_rho = atof((const char *)afl->afl_env.afl_bandit_rho);
+
+      }
+
+      if (afl->afl_env.afl_bandit_alpha) {
+
+        afl->bandit_alpha = atof((const char *)afl->afl_env.afl_bandit_alpha);
+
+      }
+
+      if (afl->afl_env.afl_bandit_gate_min) {
+
+        double gate_min =
+            atof((const char *)afl->afl_env.afl_bandit_gate_min);
+        if (gate_min > 0.0 && gate_min <= 1.0) {
+
+          afl->bandit_gate_min = gate_min;
+
+        }
+
+      }
+
+      OKF(
+          "Bandit scheduler enabled (%u arms, %llums window, reward=%s, "
+          "formula=%s, beta=%.4f, gamma=%.4f, temporal=%u, lambda=%.4f, "
+          "gate=%s, gate_min=%.3f, dict_enable=%u, dict_prob=%u, discount=%.4f,"
+          " warmup_windows=%llu, rarity_norm=%s).",
+          afl->bandit.num_arms, (unsigned long long)afl->bandit.window_ms,
+          bandit_reward_label(&afl->bandit),
+          bandit_reward_formula_label(&afl->bandit), afl->bandit.beta,
+          afl->bandit.gamma, afl->bandit_temporal, afl->bandit_lambda,
+          bandit_gate_label(afl->bandit_gate), afl->bandit_gate_min,
+          afl->bandit_dict_enable, afl->bandit_dict_prob, afl->bandit.discount,
+          (unsigned long long)afl->bandit.warmup_windows,
+          bandit_rarity_norm_label(afl->bandit.rarity_norm));
+
+    }
+
+  }
+
+  if (afl->bandit.enabled) {
+
+    afl->bandit.in_warmup = afl->bandit.warmup_windows ? 1 : 0;
+
+  }
+
+  if (afl->bandit.enabled && afl->bandit_dict_enable) {
+
+    afl->bandit_dict_prob =
+        afl->bandit.in_warmup
+            ? dict_default
+            : bandit_dict_prob_for_arm(afl->bandit.current_arm);
+
+  }
+
+  if (afl->shm.cmplog_mode || afl->cmplog_binary ||
+      getenv("AFL_CMPLOG") || getenv("AFL_LLVM_CMPLOG") ||
+      getenv("AFL_GCC_CMPLOG")) {
+
+    afl->bandit_cmplog_enabled = 1;
+
+  }
+
+  OKF("Build id: %s", afl->build_id);
+
   if (afl->shm.map_size) { afl->fsrv.map_size = afl->shm.map_size; }
 
   if (afl->afl_env.afl_forksrv_uid_set) {
@@ -2146,6 +2423,13 @@ int main(int argc, char **argv_orig, char **envp) {
   atexit(at_exit);
 
   setup_dirs_fds(afl);
+  if (afl->out_dir && access(afl->out_dir, W_OK) != 0) {
+
+    FATAL("Output directory '%s' is not writable. Use a writable path (e.g. "
+          "/tmp/out) or adjust permissions (e.g. chown/chmod).",
+          afl->out_dir);
+
+  }
 
   #ifdef HAVE_AFFINITY
   bind_to_free_cpu(afl);
@@ -3923,4 +4207,3 @@ stop_fuzzing:
 }
 
 #endif                                                          /* !AFL_LIB */
-

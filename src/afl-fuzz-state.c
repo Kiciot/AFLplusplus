@@ -109,6 +109,27 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->q_testcase_max_cache_size = TESTCASE_CACHE_SIZE * 1048576UL;
   afl->q_testcase_max_cache_entries = 64 * 1024;
   afl->last_scored_idx = -1;
+  afl->bandit.window_ms = AFL_BANDIT_DEFAULT_WINDOW_MS;
+  afl->bandit.num_arms = AFL_BANDIT_DEFAULT_ARMS;
+  afl->bandit_epoch = 1;
+  afl->bandit_temporal = 1;
+  afl->bandit_lambda = 0.0;
+  afl->bandit_gate = BANDIT_GATE_EXEC_US;
+  afl->bandit_rho = 1.0;
+  afl->bandit_alpha = 0.5;
+  afl->bandit_last_gate = 1.0;
+  afl->bandit_gate_min = 0.05;
+  afl->bandit_exec_us_ema = 0.0;
+  afl->bandit_last_exec_us = 0;
+  afl->bandit.last_win_gate = 1.0;
+  afl->bandit_dict_enable = 1;
+  afl->bandit_dict_prob = AFL_BANDIT_DICT_PROB_DEFAULT;
+  afl->bandit_win_havoc_ops = 0;
+  afl->bandit_win_dict_ops = 0;
+  afl->bandit_last_havoc_ops = 0;
+  afl->bandit_last_dict_ops = 0;
+  afl->bandit_last_dict_ratio = 0.0;
+  afl->build_id[0] = '\0';
 
 #ifdef HAVE_AFFINITY
   afl->cpu_aff = -1;                    /* Selected CPU core                */
@@ -119,6 +140,8 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->virgin_crash = ck_alloc(map_size);
   afl->var_bytes = ck_alloc(map_size);
   afl->top_rated = ck_alloc(map_size * sizeof(void *));
+  afl->edge_hit = ck_alloc(map_size * sizeof(u32));
+  afl->edge_last_seen = ck_alloc(map_size * sizeof(u32));
   afl->clean_trace = ck_alloc(map_size);
   afl->clean_trace_custom = ck_alloc(map_size);
   afl->first_trace = ck_alloc(map_size);
@@ -168,6 +191,8 @@ void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
   afl->virgin_crash = ck_realloc(afl->virgin_crash, new_size);
   afl->var_bytes = ck_realloc(afl->var_bytes, new_size);
   afl->top_rated = ck_realloc(afl->top_rated, new_size * sizeof(void *));
+  afl->edge_hit = ck_realloc(afl->edge_hit, new_size * sizeof(u32));
+  afl->edge_last_seen = ck_realloc(afl->edge_last_seen, new_size * sizeof(u32));
   afl->clean_trace = ck_realloc(afl->clean_trace, new_size);
   afl->clean_trace_custom = ck_realloc(afl->clean_trace_custom, new_size);
   afl->first_trace = ck_realloc(afl->first_trace, new_size);
@@ -179,6 +204,8 @@ void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
 
     memset(afl->var_bytes + old_size, 0, size_diff);
     memset(afl->top_rated + old_size, 0, size_diff * sizeof(void *));
+    memset(afl->edge_hit + old_size, 0, size_diff * sizeof(u32));
+    memset(afl->edge_last_seen + old_size, 0, size_diff * sizeof(u32));
     memset(afl->clean_trace + old_size, 0, size_diff);
     memset(afl->clean_trace_custom + old_size, 0, size_diff);
     memset(afl->first_trace + old_size, 0, size_diff);
@@ -438,6 +465,125 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
 
             afl->afl_env.afl_autoresume =
                 get_afl_env(afl_environment_variables[i]) ? 1 : 0;
+
+          } else if (!strncmp(env, "AFL_BANDIT",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_WINDOW_MS",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_window_ms =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_REWARD",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_reward =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_REWARD_FORMULA",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_reward_formula =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_BETA",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_beta =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_GAMMA",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_gamma =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_TEMPORAL",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_temporal =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_LAMBDA",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_lambda =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_GATE",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_gate =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_RHO",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_rho =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_ALPHA",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_alpha =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_GATE_MIN",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_gate_min =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_DICT",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_dict =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_DICT_PROB_DEFAULT",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_dict_prob_default =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_DISCOUNT",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_discount =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_WARMUP_WINDOWS",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_warmup_windows =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
+
+          } else if (!strncmp(env, "AFL_BANDIT_RARITY_NORM",
+
+                              afl_environment_variable_len)) {
+
+            afl->afl_env.afl_bandit_rarity_norm =
+                (u8 *)get_afl_env(afl_environment_variables[i]);
 
           } else if (!strncmp(env, "AFL_PERSISTENT_RECORD",
 
@@ -906,6 +1052,8 @@ void afl_state_deinit(afl_state_t *afl) {
   ck_free(afl->virgin_crash);
   ck_free(afl->var_bytes);
   ck_free(afl->top_rated);
+  ck_free(afl->edge_hit);
+  ck_free(afl->edge_last_seen);
   ck_free(afl->clean_trace);
   ck_free(afl->clean_trace_custom);
   ck_free(afl->first_trace);
@@ -941,6 +1089,8 @@ void afl_state_deinit(afl_state_t *afl) {
   ck_free(afl->havoc_prof);
 
   ck_free(afl->afl_env.afl_forksrv_supl_gids);
+
+  bandit_deinit(&afl->bandit);
 
   list_remove(&afl_states, afl);
 
@@ -986,4 +1136,3 @@ void afl_states_request_skip(void) {
   LIST_FOREACH(&afl_states, afl_state_t, { el->skip_requested = 1; });
 
 }
-

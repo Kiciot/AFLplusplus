@@ -425,6 +425,56 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
           "testcache_size    : %llu\n"
           "testcache_count   : %u\n"
           "testcache_evict   : %u\n"
+          "bandit_enabled    : %u\n"
+          "bandit_arm        : %u\n"
+          "bandit_window_ms  : %llu\n"
+          "bandit_last_cov   : %llu\n"
+          "bandit_last_new_bits : %llu\n"
+          "bandit_last_novelty  : %0.04f\n"
+          "bandit_last_rarity_mass : %0.04f\n"
+          "bandit_last_rarity_samples: %llu\n"
+          "bandit_last_execs : %llu\n"
+          "bandit_last_time_us : %llu\n"
+          "bandit_last_timeouts: %llu\n"
+          "bandit_last_slow_execs: %llu\n"
+          "bandit_last_reward : %0.04f\n"
+          "bandit_multiplier : %0.02f\n"
+          "bandit_reward_type: %s\n"
+          "bandit_reward_formula: %s\n"
+          "bandit_rarity_norm: %s\n"
+          "bandit_last_path_len_avg: %0.02f\n"
+          "bandit_last_rarity_density: %0.04f\n"
+          "bandit_discount   : %0.04f\n"
+          "bandit_warmup_windows: %llu\n"
+          "bandit_in_warmup  : %u\n"
+          "bandit_hit_max    : %u\n"
+          "bandit_epoch      : %u\n"
+          "bandit_temporal   : %u\n"
+          "bandit_lambda     : %0.04f\n"
+          "bandit_gate       : %s\n"
+          "bandit_gate_rho   : %0.04f\n"
+          "bandit_gate_alpha : %0.04f\n"
+          "bandit_last_gate  : %0.04f\n"
+          "bandit_gate_samples: %llu\n"
+          "bandit_last_gate_execavg : %0.04f\n"
+          "bandit_gate_exec_samples: %llu\n"
+          "bandit_gate_min   : %0.04f\n"
+          "bandit_exec_us_ema: %0.02f\n"
+          "bandit_dict_enable: %u\n"
+          "bandit_dict_prob  : %u\n"
+          "bandit_cmplog_enabled: %u\n"
+          "bandit_last_cmplog_execs: %llu\n"
+          "bandit_extras_cnt : %u\n"
+          "bandit_a_extras_cnt: %u\n"
+          "bandit_last_havoc_ops : %llu\n"
+          "bandit_last_dict_ops  : %llu\n"
+          "bandit_last_dict_ratio: %0.04f\n"
+          "bandit_rotate_us_last : %llu\n"
+          "bandit_rotate_us_avg  : %0.02f\n"
+          "bandit_novelty_us_last: %llu\n"
+          "bandit_novelty_us_avg : %0.02f\n"
+          "bandit_novelty_samples: %llu\n"
+          "bandit_build_id    : %s\n"
           "afl_banner        : %s\n"
           "afl_version       : " VERSION
           "\n"
@@ -468,7 +518,40 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
           t_bytes, afl->fsrv.real_map_size, afl->var_byte_count,
           afl->expand_havoc, afl->a_extras_cnt, afl->q_testcase_cache_size,
           afl->q_testcase_cache_count, afl->q_testcase_evictions,
-          afl->use_banner, afl->unicorn_mode ? "unicorn" : "",
+          afl->bandit.enabled, afl->bandit.current_arm, afl->bandit.window_ms,
+          afl->bandit.last_win_new_cov, afl->bandit.last_win_new_bits,
+          afl->bandit.last_win_novelty, afl->bandit.last_win_rarity_mass,
+          afl->bandit.last_win_rarity_samples, afl->bandit.last_win_execs,
+          afl->bandit.last_win_time_us, afl->bandit.last_win_timeouts,
+          afl->bandit.last_win_slow_execs, afl->bandit.last_reward,
+          bandit_current_multiplier(&afl->bandit),
+          bandit_reward_label(&afl->bandit),
+          bandit_reward_formula_label(&afl->bandit),
+          bandit_rarity_norm_label(afl->bandit.rarity_norm),
+          afl->bandit.last_path_len_avg, afl->bandit.last_rarity_density,
+          afl->bandit.discount, afl->bandit.warmup_windows,
+          afl->bandit.in_warmup, afl->bandit.hit_max, afl->bandit_epoch,
+          afl->bandit_temporal, afl->bandit_lambda,
+          bandit_gate_label(afl->bandit_gate), afl->bandit_rho,
+          afl->bandit_alpha, afl->bandit.last_win_gate,
+          afl->bandit.last_win_gate_samples, afl->bandit.last_win_gate_execavg,
+          afl->bandit.last_win_gate_exec_samples, afl->bandit_gate_min,
+          afl->bandit_exec_us_ema, afl->bandit_dict_enable,
+          afl->bandit_dict_prob, afl->bandit_cmplog_enabled,
+          afl->bandit_last_cmplog_execs, afl->extras_cnt, afl->a_extras_cnt,
+          afl->bandit_last_havoc_ops, afl->bandit_last_dict_ops,
+          afl->bandit_last_dict_ratio, afl->bandit.last_rotate_us,
+          afl->bandit.rotate_count
+              ? (double)afl->bandit.rotate_us_total /
+                    (double)afl->bandit.rotate_count
+              : 0.0,
+          afl->bandit.last_novelty_us,
+          afl->bandit.novelty_samples
+              ? (double)afl->bandit.novelty_us_total /
+                    (double)afl->bandit.novelty_samples
+              : 0.0,
+          afl->bandit.novelty_samples, afl->build_id, afl->use_banner,
+          afl->unicorn_mode ? "unicorn" : "",
           afl->fsrv.qemu_mode ? "qemu " : "",
           afl->fsrv.cs_mode ? "coresight" : "",
           afl->non_instrumented_mode ? " non_instrumented " : "",
@@ -695,6 +778,35 @@ static void check_term_size(afl_state_t *afl) {
    execve() calls, plus in several other circumstances. */
 
 void show_stats(afl_state_t *afl) {
+
+  if (afl->bandit.enabled) {
+
+    u8 rotated = bandit_maybe_rotate(&afl->bandit, get_cur_time());
+    if (rotated) {
+
+      ++afl->bandit_epoch;
+      if (afl->bandit_dict_enable && !afl->bandit.in_warmup) {
+
+        afl->bandit_dict_prob =
+            bandit_dict_prob_for_arm(afl->bandit.current_arm);
+
+      }
+
+      afl->bandit_last_havoc_ops = afl->bandit_win_havoc_ops;
+      afl->bandit_last_dict_ops = afl->bandit_win_dict_ops;
+      afl->bandit_last_dict_ratio =
+          afl->bandit_win_havoc_ops
+              ? (double)afl->bandit_win_dict_ops /
+                    (double)afl->bandit_win_havoc_ops
+              : 0.0;
+      afl->bandit_last_cmplog_execs = afl->bandit_win_cmplog_execs;
+      afl->bandit_win_havoc_ops = 0;
+      afl->bandit_win_dict_ops = 0;
+      afl->bandit_win_cmplog_execs = 0;
+
+    }
+
+  }
 
   if (afl->pizza_is_served) {
 
@@ -2594,4 +2706,3 @@ inline void update_cmplog_time(afl_state_t *afl, u64 *time) {
   *time = cur;
 
 }
-

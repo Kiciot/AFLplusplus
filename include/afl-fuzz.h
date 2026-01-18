@@ -47,6 +47,7 @@
 #include "common.h"
 
 #include "afl-ijon-min.h"
+#include "afl-fuzz-bandit.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -474,7 +475,14 @@ typedef struct afl_env_vars {
       *afl_max_det_extras, *afl_statsd_host, *afl_statsd_port,
       *afl_crash_exitcode, *afl_statsd_tags_flavor, *afl_testcache_size,
       *afl_testcache_entries, *afl_child_kill_signal, *afl_fsrv_kill_signal,
-      *afl_target_env, *afl_persistent_record, *afl_exit_on_time;
+      *afl_target_env, *afl_persistent_record, *afl_exit_on_time,
+      *afl_bandit, *afl_bandit_window_ms, *afl_bandit_reward,
+      *afl_bandit_reward_formula, *afl_bandit_beta, *afl_bandit_gamma,
+      *afl_bandit_temporal, *afl_bandit_lambda, *afl_bandit_gate,
+      *afl_bandit_rho, *afl_bandit_alpha, *afl_bandit_gate_min,
+      *afl_bandit_dict, *afl_bandit_dict_prob_default,
+      *afl_bandit_discount, *afl_bandit_warmup_windows,
+      *afl_bandit_rarity_norm;
 
   s32 afl_pizza_mode, afl_ijon_history_limit;
 
@@ -510,7 +518,10 @@ typedef struct afl_state {
   sharedmem_t     *shm_fuzz;
   afl_env_vars_t   afl_env;
 
+  u8 build_id[64];
+
   char **argv;                                            /* argv if needed */
+  bandit_state_t bandit;                                  /* bandit scheduler */
 
   /* MOpt:
     Lots of globals, but mostly for the status UI and other things where it
@@ -620,6 +631,28 @@ typedef struct afl_state {
   u8 *virgin_bits,                      /* Regions yet untouched by fuzzing */
       *virgin_tmout,                    /* Bits we haven't seen in tmouts   */
       *virgin_crash;                    /* Bits we haven't seen in crashes  */
+  u32 *edge_hit;                        /* Per-slot novelty hit counters    */
+  u32 *edge_last_seen;                  /* Per-slot temporal novelty marker */
+  u32  bandit_epoch;                    /* Temporal novelty epoch (windows) */
+  u8   bandit_temporal;                 /* Temporal novelty enabled?        */
+  double bandit_lambda;                 /* Temporal novelty lambda          */
+  bandit_gate_t bandit_gate;            /* Complexity gate mode             */
+  double bandit_rho;                    /* Exec-us gate strength            */
+  double bandit_alpha;                  /* Path length gate exponent        */
+  double bandit_last_gate;              /* Last applied gate factor         */
+  double bandit_gate_min;               /* Minimum gate clamp               */
+  double bandit_exec_us_ema;            /* Smoothed exec_us baseline        */
+  u64    bandit_last_exec_us;           /* Last exec time in microseconds   */
+  u32    bandit_dict_prob;              /* Dict mutation intensity (0-100)  */
+  u32    bandit_dict_enable;            /* Enable bandit dict control       */
+  u8     bandit_cmplog_enabled;         /* CmpLog observed enabled flag     */
+  u64    bandit_win_cmplog_execs;       /* CmpLog execs in current window   */
+  u64    bandit_last_cmplog_execs;      /* CmpLog execs in last window      */
+  u64    bandit_win_havoc_ops;          /* Havoc ops in current window      */
+  u64    bandit_win_dict_ops;           /* Dict ops in current window       */
+  u64    bandit_last_havoc_ops;         /* Havoc ops in last window         */
+  u64    bandit_last_dict_ops;          /* Dict ops in last window          */
+  double bandit_last_dict_ratio;        /* Dict ops / havoc ops last window */
 
   double *alias_probability;            /* alias weighted probabilities     */
   u32    *alias_table;                /* alias weighted random lookup table */
@@ -1507,4 +1540,3 @@ static inline u8 bitmap_read(u8 *map, u32 index) {
 #endif
 
 #endif
-

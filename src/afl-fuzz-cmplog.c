@@ -93,7 +93,8 @@ u8 common_fuzz_cmplog_stuff(afl_state_t *afl, u8 *out_buf, u32 len) {
 
   }
 
+  if (afl->bandit.enabled) { afl->bandit_win_cmplog_execs++; }
+
   return 0;
 
 }
-

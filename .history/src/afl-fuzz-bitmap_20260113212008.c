@@ -221,88 +221,37 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 
 #ifdef WORD_SIZE_64
 
-  typedef u64 word_t;
-  word_t *current = (word_t *)afl->fsrv.trace_bits;
-  word_t *virgin = (word_t *)virgin_map;
+  u64 *current = (u64 *)afl->fsrv.trace_bits;
+  u64 *virgin = (u64 *)virgin_map;
 
   u32       i = ((afl->fsrv.real_map_size + 7) >> 3);
   const u32 word_bytes = 8;
 
 #else
 
-  typedef u32 word_t;
-  word_t *current = (word_t *)afl->fsrv.trace_bits;
-  word_t *virgin = (word_t *)virgin_map;
+  u32 *current = (u32 *)afl->fsrv.trace_bits;
+  u32 *virgin = (u32 *)virgin_map;
 
   u32       i = ((afl->fsrv.real_map_size + 3) >> 2);
   const u32 word_bytes = 4;
 
 #endif                                                     /* ^WORD_SIZE_64 */
 
-  u8     ret = 0;
-  u64    delta_bits = 0;
+  u8 ret = 0;
+  u64   delta_bits = 0;
   double delta_novelty = 0.0;
-  double rarity_mass = 0.0;
-  double gate = 1.0;
-  u64    path_len = 0;
-  u32    now_epoch = afl->bandit_epoch ? afl->bandit_epoch : 1;
-  u8     measure_novelty = 0;
-  u64    novelty_start_us = 0;
-  if (afl->bandit.enabled) {
-
-    measure_novelty =
-        (virgin_map == afl->virgin_bits) &&
-        ((afl->fsrv.total_execs & 1023) == 0);
-    if (measure_novelty) { novelty_start_us = get_cur_time_us(); }
-
-  }
-
-  u8 need_path_len = afl->bandit.enabled &&
-                     (afl->bandit_gate == BANDIT_GATE_PATH_LEN ||
-                      (afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS &&
-                       afl->bandit.rarity_norm == BANDIT_RARITY_NORM_PATH_LEN));
 
   for (u32 idx = 0; idx < i; ++idx) {
 
-    word_t cur_word = current[idx];
+    u64 cur_word = current[idx];
 
     if (unlikely(cur_word)) {
 
-      if (need_path_len) {
-
-        const u8 *cur_bytes = (const u8 *)&cur_word;
-        for (u32 b = 0; b < word_bytes; ++b) {
-
-          if (cur_bytes[b]) { ++path_len; }
-
-        }
-
-      }
-
-      if (afl->bandit.enabled &&
-          afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS &&
-          afl->edge_hit) {
-
-        const u8 *cur_bytes = (const u8 *)&cur_word;
-        size_t     base = ((size_t)idx) * word_bytes;
-        for (u32 b = 0; b < word_bytes; ++b) {
-
-          if (!cur_bytes[b]) { continue; }
-          u32 slot = (u32)(base + b);
-          if (slot >= afl->fsrv.real_map_size) { break; }
-          u32    hits = afl->edge_hit[slot];
-          double rarity = 1.0 / sqrt((double)hits + 1.0);
-          rarity_mass += rarity;
-
-        }
-
-      }
-
-      word_t *vir_word = &virgin[idx];
+      u64 *vir_word = &virgin[idx];
 
       if (afl->bandit.enabled && virgin_map == afl->virgin_bits) {
 
-        word_t new_word = cur_word & *vir_word;
+        u64 new_word = cur_word & *vir_word;
 
         if (new_word) {
 
@@ -315,38 +264,20 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
             if (!new_byte) { continue; }
 
             u32 slot = (u32)(base + b);
-            if (slot >= afl->fsrv.real_map_size) { break; }
-            delta_bits += 1;
+            u32 pop = (u32)__builtin_popcount((unsigned)new_byte);
+            delta_bits += pop;
 
             if (afl->edge_hit) {
 
               u32 hits = afl->edge_hit[slot];
 
-              double novelty_inc = 1.0 / sqrt((double)hits + 1.0);
+              for (u32 p = 0; p < pop; ++p) {
 
-              if (afl->bandit_temporal && afl->edge_last_seen) {
-
-                u32 last_seen = afl->edge_last_seen[slot];
-                u32 dt = now_epoch >= last_seen ? now_epoch - last_seen : 0;
-                double temporal = 0.0;
-
-                if (afl->bandit_lambda > 0.0) {
-
-                  temporal = 1.0 - exp(-afl->bandit_lambda * (double)dt);
-
-                } else {
-
-                  temporal = log1p((double)dt);
-
-                }
-
-                novelty_inc *= temporal;
-                afl->edge_last_seen[slot] = now_epoch;
+                double novelty_inc = 1.0 / sqrt((double)hits + 1.0);
+                delta_novelty += novelty_inc;
+                if (hits < UINT32_MAX) { ++hits; }
 
               }
-
-              delta_novelty += novelty_inc;
-              if (hits < UINT32_MAX) { ++hits; }
 
               afl->edge_hit[slot] = hits;
               if (hits > afl->bandit.hit_max) { afl->bandit.hit_max = hits; }
@@ -365,71 +296,15 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 
   }
 
-  if (afl->bandit.enabled) {
-
-    if (afl->bandit_gate == BANDIT_GATE_EXEC_US) {
-
-      double baseline_exec_us = afl->bandit_exec_us_ema;
-      if (baseline_exec_us < 1.0) {
-
-        baseline_exec_us = (double)afl->bandit_last_exec_us;
-
-      }
-
-      if (baseline_exec_us < 1.0) { baseline_exec_us = 1.0; }
-
-      double norm_exec =
-          (double)afl->bandit_last_exec_us / baseline_exec_us;
-      double excess = norm_exec > 1.0 ? (norm_exec - 1.0) : 0.0;
-      gate = 1.0 / (1.0 + afl->bandit_rho * excess);
-      if (gate > 1.0) { gate = 1.0; }
-      if (gate < afl->bandit_gate_min) { gate = afl->bandit_gate_min; }
-
-    } else if (afl->bandit_gate == BANDIT_GATE_PATH_LEN) {
-
-      if (!path_len) { path_len = 1; }
-      gate = 1.0 / pow((double)path_len, afl->bandit_alpha);
-      if (gate > 1.0) { gate = 1.0; }
-      if (gate < afl->bandit_gate_min) { gate = afl->bandit_gate_min; }
-
-    } else {
-
-      gate = 1.0;
-
-    }
-
-    afl->bandit_last_gate = gate;
-    delta_novelty *= gate;
-    rarity_mass *= gate;
-    bandit_on_exec_gate(&afl->bandit, gate);
-
-  }
-
-  if (measure_novelty) {
-
-    u64 delta_us = get_cur_time_us() - novelty_start_us;
-    afl->bandit.novelty_us_total += delta_us;
-    afl->bandit.novelty_samples++;
-    afl->bandit.last_novelty_us = delta_us;
-
-  }
-
   if (unlikely(ret) && likely(virgin_map == afl->virgin_bits)) {
 
     afl->bitmap_changed = 1;
 
     if (afl->bandit.enabled && (ret & 2) != 0) {
 
-      bandit_on_new_cov(&afl->bandit, delta_bits, delta_novelty, gate);
+      bandit_on_new_cov(&afl->bandit, delta_bits, delta_novelty);
 
     }
-
-  }
-
-  if (afl->bandit.enabled &&
-      afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS) {
-
-    bandit_on_rarity_mass(&afl->bandit, rarity_mass, path_len);
 
   }
 
@@ -455,37 +330,13 @@ static inline u8 has_new_bits_unclassified(afl_state_t *afl, u8 *virgin_map,
 
 #ifdef WORD_SIZE_64
 
-  if (!skim((u64 *)virgin_map, (u64 *)afl->fsrv.trace_bits, (u64 *)end)) {
-
-    if (afl->bandit.enabled &&
-        afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS) {
-
-      classify_counts(&afl->fsrv);
-      *classified = true;
-      return has_new_bits(afl, virgin_map);
-
-    }
-
+  if (!skim((u64 *)virgin_map, (u64 *)afl->fsrv.trace_bits, (u64 *)end))
     return 0;
-
-  }
 
 #else
 
-  if (!skim((u32 *)virgin_map, (u32 *)afl->fsrv.trace_bits, (u32 *)end)) {
-
-    if (afl->bandit.enabled &&
-        afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS) {
-
-      classify_counts(&afl->fsrv);
-      *classified = true;
-      return has_new_bits(afl, virgin_map);
-
-    }
-
+  if (!skim((u32 *)virgin_map, (u32 *)afl->fsrv.trace_bits, (u32 *)end))
     return 0;
-
-  }
 
 #endif                                                     /* ^WORD_SIZE_64 */
   classify_counts(&afl->fsrv);

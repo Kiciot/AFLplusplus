@@ -535,10 +535,14 @@ u8 fuzz_one_original(afl_state_t *afl) {
    *********************/
 
   if (likely(!afl->old_seed_selection))
-    orig_perf = perf_score = afl->queue_cur->perf_score;
+    perf_score = afl->queue_cur->perf_score;
   else
-    afl->queue_cur->perf_score = orig_perf = perf_score =
+    afl->queue_cur->perf_score = perf_score =
         calculate_score(afl, afl->queue_cur);
+
+  perf_score = bandit_scale_score(&afl->bandit, perf_score,
+                                  afl->havoc_max_mult * 100);
+  orig_perf = perf_score;
 
   if (unlikely(perf_score <= 0 && afl->active_items > 1)) {
 
@@ -2231,6 +2235,7 @@ havoc_stage:
     retry_havoc_step: {
 
       u32 r = rand_below(afl, rand_max), item;
+      afl->bandit_win_havoc_ops++;
 
       switch (mutation_array[r]) {
 
@@ -3081,6 +3086,12 @@ havoc_stage:
         case MUT_EXTRA_OVERWRITE: {
 
           if (unlikely(!afl->extras_cnt)) { goto retry_havoc_step; }
+          if (afl->bandit_dict_enable &&
+              rand_below(afl, 100) >= afl->bandit_dict_prob) {
+
+            goto retry_havoc_step;
+
+          }
 
           /* Use the dictionary. */
 
@@ -3095,7 +3106,8 @@ havoc_stage:
                    insert_at, extra_len);
           strcat(afl->mutation, afl->m_tmp);
 #endif
-          memcpy(out_buf + insert_at, afl->extras[use_extra].data, extra_len);
+         memcpy(out_buf + insert_at, afl->extras[use_extra].data, extra_len);
+          afl->bandit_win_dict_ops++;
 
           break;
 
@@ -3104,6 +3116,12 @@ havoc_stage:
         case MUT_EXTRA_INSERT: {
 
           if (unlikely(!afl->extras_cnt)) { goto retry_havoc_step; }
+          if (afl->bandit_dict_enable &&
+              rand_below(afl, 100) >= afl->bandit_dict_prob) {
+
+            goto retry_havoc_step;
+
+          }
 
           u32 use_extra = rand_below(afl, afl->extras_cnt);
           u32 extra_len = afl->extras[use_extra].len;
@@ -3131,6 +3149,7 @@ havoc_stage:
           /* Inserted part */
           memcpy(out_buf + insert_at, ptr, extra_len);
           temp_len += extra_len;
+          afl->bandit_win_dict_ops++;
 
           break;
 
@@ -3139,6 +3158,12 @@ havoc_stage:
         case MUT_AUTO_EXTRA_OVERWRITE: {
 
           if (unlikely(!afl->a_extras_cnt)) { goto retry_havoc_step; }
+          if (afl->bandit_dict_enable &&
+              rand_below(afl, 100) >= afl->bandit_dict_prob) {
+
+            goto retry_havoc_step;
+
+          }
 
           /* Use the dictionary. */
 
@@ -3154,6 +3179,7 @@ havoc_stage:
           strcat(afl->mutation, afl->m_tmp);
 #endif
           memcpy(out_buf + insert_at, afl->a_extras[use_extra].data, extra_len);
+          afl->bandit_win_dict_ops++;
 
           break;
 
@@ -3162,6 +3188,12 @@ havoc_stage:
         case MUT_AUTO_EXTRA_INSERT: {
 
           if (unlikely(!afl->a_extras_cnt)) { goto retry_havoc_step; }
+          if (afl->bandit_dict_enable &&
+              rand_below(afl, 100) >= afl->bandit_dict_prob) {
+
+            goto retry_havoc_step;
+
+          }
 
           u32 use_extra = rand_below(afl, afl->a_extras_cnt);
           u32 extra_len = afl->a_extras[use_extra].len;
@@ -3189,6 +3221,7 @@ havoc_stage:
           /* Inserted part */
           memcpy(out_buf + insert_at, ptr, extra_len);
           temp_len += extra_len;
+          afl->bandit_win_dict_ops++;
 
           break;
 
@@ -3664,9 +3697,13 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
    *********************/
 
   if (likely(!afl->old_seed_selection))
-    orig_perf = perf_score = afl->queue_cur->perf_score;
+    perf_score = afl->queue_cur->perf_score;
   else
-    orig_perf = perf_score = calculate_score(afl, afl->queue_cur);
+    perf_score = calculate_score(afl, afl->queue_cur);
+
+  perf_score = bandit_scale_score(&afl->bandit, perf_score,
+                                  afl->havoc_max_mult * 100);
+  orig_perf = perf_score;
 
   if (unlikely(perf_score <= 0 && afl->active_items > 1)) {
 
@@ -6354,4 +6391,3 @@ u8 fuzz_one(afl_state_t *afl) {
   return (key_val_lv_1 | key_val_lv_2);
 
 }
-
