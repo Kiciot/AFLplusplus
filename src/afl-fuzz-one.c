@@ -1601,6 +1601,8 @@ skip_interest:
   afl->stage_val_type = STAGE_VAL_NONE;
 
   orig_hit_cnt = new_hit_cnt;
+  u32 dict_gate_pct =
+      afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
 
   for (i = 0; i < (u32)len; ++i) {
 
@@ -1632,6 +1634,11 @@ skip_interest:
         --afl->stage_max;
         continue;
 
+      }
+
+      if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+        --afl->stage_max;
+        continue;
       }
 
       last_len = afl->extras[j].len;
@@ -1672,6 +1679,7 @@ skip_interest:
 
   ex_tmp = afl_realloc(AFL_BUF_PARAM(ex), len + MAX_DICT_FILE);
   if (unlikely(!ex_tmp)) { PFATAL("alloc"); }
+  dict_gate_pct = afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
 
   for (i = 0; i <= (u32)len; ++i) {
 
@@ -1688,6 +1696,11 @@ skip_interest:
         --afl->stage_max;
         continue;
 
+      }
+
+      if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+        --afl->stage_max;
+        continue;
       }
 
       /* Insert token */
@@ -1736,6 +1749,7 @@ skip_user_extras:
   afl->stage_val_type = STAGE_VAL_NONE;
 
   orig_hit_cnt = new_hit_cnt;
+  dict_gate_pct = afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
 
   for (i = 0; i < (u32)len; ++i) {
 
@@ -1758,6 +1772,11 @@ skip_user_extras:
         --afl->stage_max;
         continue;
 
+      }
+
+      if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+        --afl->stage_max;
+        continue;
       }
 
       last_len = afl->a_extras[j].len;
@@ -1795,6 +1814,7 @@ skip_user_extras:
   afl->stage_max = afl->a_extras_cnt * (len + 1);
 
   orig_hit_cnt = new_hit_cnt;
+  dict_gate_pct = afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
 
   ex_tmp = afl_realloc(AFL_BUF_PARAM(ex), len + MAX_DICT_FILE);
   if (unlikely(!ex_tmp)) { PFATAL("alloc"); }
@@ -1814,6 +1834,11 @@ skip_user_extras:
         --afl->stage_max;
         continue;
 
+      }
+
+      if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+        --afl->stage_max;
+        continue;
       }
 
       /* Insert token */
@@ -3086,12 +3111,9 @@ havoc_stage:
         case MUT_EXTRA_OVERWRITE: {
 
           if (unlikely(!afl->extras_cnt)) { goto retry_havoc_step; }
-          if (afl->bandit_dict_enable &&
-              rand_below(afl, 100) >= afl->bandit_dict_prob) {
-
-            goto retry_havoc_step;
-
-          }
+          u32 gate_pct =
+              afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
+          if (!adarare_allow_dict_mut(afl, gate_pct)) { goto retry_havoc_step; }
 
           /* Use the dictionary. */
 
@@ -3116,12 +3138,9 @@ havoc_stage:
         case MUT_EXTRA_INSERT: {
 
           if (unlikely(!afl->extras_cnt)) { goto retry_havoc_step; }
-          if (afl->bandit_dict_enable &&
-              rand_below(afl, 100) >= afl->bandit_dict_prob) {
-
-            goto retry_havoc_step;
-
-          }
+          u32 gate_pct =
+              afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
+          if (!adarare_allow_dict_mut(afl, gate_pct)) { goto retry_havoc_step; }
 
           u32 use_extra = rand_below(afl, afl->extras_cnt);
           u32 extra_len = afl->extras[use_extra].len;
@@ -3158,12 +3177,9 @@ havoc_stage:
         case MUT_AUTO_EXTRA_OVERWRITE: {
 
           if (unlikely(!afl->a_extras_cnt)) { goto retry_havoc_step; }
-          if (afl->bandit_dict_enable &&
-              rand_below(afl, 100) >= afl->bandit_dict_prob) {
-
-            goto retry_havoc_step;
-
-          }
+          u32 gate_pct =
+              afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
+          if (!adarare_allow_dict_mut(afl, gate_pct)) { goto retry_havoc_step; }
 
           /* Use the dictionary. */
 
@@ -3188,12 +3204,9 @@ havoc_stage:
         case MUT_AUTO_EXTRA_INSERT: {
 
           if (unlikely(!afl->a_extras_cnt)) { goto retry_havoc_step; }
-          if (afl->bandit_dict_enable &&
-              rand_below(afl, 100) >= afl->bandit_dict_prob) {
-
-            goto retry_havoc_step;
-
-          }
+          u32 gate_pct =
+              afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
+          if (!adarare_allow_dict_mut(afl, gate_pct)) { goto retry_havoc_step; }
 
           u32 use_extra = rand_below(afl, afl->a_extras_cnt);
           u32 extra_len = afl->a_extras[use_extra].len;

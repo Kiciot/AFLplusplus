@@ -379,6 +379,10 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
                     1000;
   if (!runtime_ms) { runtime_ms = 1; }
 
+  double adarare_thrpt = afl->bandit.last_thrpt;
+  double adarare_thrpt_ref = afl->bandit.last_thrpt_ref;
+  const char *adarare_arm_label = bandit_arm_label(afl->bandit.last_arm_used);
+
   fprintf(f,
           "start_time        : %llu\n"
           "last_update       : %llu\n"
@@ -469,6 +473,36 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
           "bandit_last_havoc_ops : %llu\n"
           "bandit_last_dict_ops  : %llu\n"
           "bandit_last_dict_ratio: %0.04f\n"
+          "bandit_p90_valid  : %u\n"
+          "bandit_p90_n      : %u\n"
+          "bandit_dict_attempts_win: %llu\n"
+          "bandit_dict_taken_win  : %llu\n"
+          "bandit_dict_attempts_total: %llu\n"
+          "bandit_dict_taken_total  : %llu\n"
+          "linucb_invert_fail_last : %llu\n"
+          "linucb_rad_cap_hits_last : %llu\n"
+          "linucb_score_cap_hits_last : %llu\n"
+          "linucb_invert_fail_total : %llu\n"
+          "linucb_rad_cap_hits_total : %llu\n"
+          "linucb_score_cap_hits_total : %llu\n"
+          "adarare_arm       : %u\n"
+          "adarare_arm_label : %s\n"
+          "adarare_mix_choice: %u\n"
+          "adarare_reward    : %0.04f\n"
+          "adarare_base_raw  : %0.04f\n"
+          "adarare_ucb_score : %0.04f\n"
+          "adarare_p90_score : %0.04f\n"
+          "adarare_gate_factor: %0.04f\n"
+          "adarare_thrpt     : %0.04f\n"
+          "adarare_thrpt_ref : %0.04f\n"
+          "adarare_dict_prob : %u\n"
+          "adarare_dict_enable: %u\n"
+          "adarare_dict_baseline_prob: %u\n"
+          "adarare_reward_alpha: %0.04f\n"
+          "adarare_reward_beta : %0.04f\n"
+          "adarare_reward_gamma: %0.04f\n"
+          "adarare_reward_c1   : %0.04f\n"
+          "adarare_reward_c2   : %0.04f\n"
           "bandit_rotate_us_last : %llu\n"
           "bandit_rotate_us_avg  : %0.02f\n"
           "bandit_novelty_us_last: %llu\n"
@@ -540,7 +574,25 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
           afl->bandit_dict_prob, afl->bandit_cmplog_enabled,
           afl->bandit_last_cmplog_execs, afl->extras_cnt, afl->a_extras_cnt,
           afl->bandit_last_havoc_ops, afl->bandit_last_dict_ops,
-          afl->bandit_last_dict_ratio, afl->bandit.last_rotate_us,
+          afl->bandit_last_dict_ratio, afl->bandit.last_p90_valid,
+          afl->bandit.last_p90_n, afl->bandit.last_dict_attempts,
+          afl->bandit.last_dict_taken,
+          afl->adarare_dict_attempts_total, afl->adarare_dict_taken_total,
+          afl->bandit.linucb_invert_fail_last,
+          afl->bandit.linucb_rad_cap_hits_last,
+          afl->bandit.linucb_score_cap_hits_last,
+          afl->bandit.linucb_invert_fail_total,
+          afl->bandit.linucb_rad_cap_hits_total,
+          afl->bandit.linucb_score_cap_hits_total, afl->bandit.last_arm_used,
+          adarare_arm_label, afl->bandit.last_mix_choice,
+          afl->bandit.last_reward, afl->bandit.last_base_raw,
+          afl->bandit.last_ucb_score, afl->bandit.last_p90_score,
+          afl->bandit.last_gate_factor, adarare_thrpt, adarare_thrpt_ref,
+          afl->bandit.last_dict_prob, afl->bandit.dict_enable,
+          afl->bandit.dict_baseline_prob, afl->bandit.reward_alpha,
+          afl->bandit.reward_beta, afl->bandit.reward_gamma,
+          afl->bandit.reward_c1, afl->bandit.reward_c2,
+          afl->bandit.last_rotate_us,
           afl->bandit.rotate_count
               ? (double)afl->bandit.rotate_us_total /
                     (double)afl->bandit.rotate_count
@@ -781,14 +833,13 @@ void show_stats(afl_state_t *afl) {
 
   if (afl->bandit.enabled) {
 
-    u8 rotated = bandit_maybe_rotate(&afl->bandit, get_cur_time());
+    u8 rotated = bandit_maybe_rotate(&afl->bandit);
     if (rotated) {
 
       ++afl->bandit_epoch;
       if (afl->bandit_dict_enable && !afl->bandit.in_warmup) {
 
-        afl->bandit_dict_prob =
-            bandit_dict_prob_for_arm(afl->bandit.current_arm);
+        afl->bandit_dict_prob = afl->bandit.last_dict_prob;
 
       }
 

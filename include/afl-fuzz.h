@@ -29,6 +29,7 @@
 
 #define AFL_MAIN
 #define MESSAGES_TO_STDOUT
+#define AFL_ADARARE_RARITY_MAX 1e9
 
 #ifndef _GNU_SOURCE
   #define _GNU_SOURCE
@@ -243,6 +244,8 @@ struct queue_entry {
       exec_cksum,                       /* Checksum of the execution trace  */
       custom,                           /* Marker for custom mutators       */
       stats_mutated;                    /* stats: # of mutations performed  */
+
+  double rarity_score;                  /* Accumulated rarity score         */
 
   u32 tc_ref;                           /* Trace bytes ref count            */
 
@@ -645,6 +648,11 @@ typedef struct afl_state {
   u64    bandit_last_exec_us;           /* Last exec time in microseconds   */
   u32    bandit_dict_prob;              /* Dict mutation intensity (0-100)  */
   u32    bandit_dict_enable;            /* Enable bandit dict control       */
+  u32    adarare_dict_prob;             /* Effective dict prob (current)    */
+  u64    adarare_dict_attempts_win;     /* Dict gate attempts (window)      */
+  u64    adarare_dict_taken_win;        /* Dict gate taken (window)         */
+  u64    adarare_dict_attempts_total;   /* Dict gate attempts (total)       */
+  u64    adarare_dict_taken_total;      /* Dict gate taken (total)          */
   u8     bandit_cmplog_enabled;         /* CmpLog observed enabled flag     */
   u64    bandit_win_cmplog_execs;       /* CmpLog execs in current window   */
   u64    bandit_last_cmplog_execs;      /* CmpLog execs in last window      */
@@ -1206,6 +1214,7 @@ void afl_states_stop(void);
 void afl_states_clear_screen(void);
 /* Sets the skip flag on all states */
 void afl_states_request_skip(void);
+u8 adarare_allow_dict_mut(struct afl_state *afl, u32 pct);
 
 /* Setup shmem for testcase delivery */
 void setup_testcase_shmem(afl_state_t *afl);
@@ -1534,6 +1543,8 @@ static inline u8 bitmap_read(u8 *map, u32 index) {
   return (map[index / 8] >> (index % 8)) & 1;
 
 }
+
+
 
 #if TESTCASE_CACHE == 1
   #error define of TESTCASE_CACHE must be zero or larger than 1

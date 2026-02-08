@@ -124,6 +124,11 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->bandit.last_win_gate = 1.0;
   afl->bandit_dict_enable = 1;
   afl->bandit_dict_prob = AFL_BANDIT_DICT_PROB_DEFAULT;
+  afl->adarare_dict_prob = AFL_BANDIT_DICT_PROB_DEFAULT;
+  afl->adarare_dict_attempts_win = 0;
+  afl->adarare_dict_taken_win = 0;
+  afl->adarare_dict_attempts_total = 0;
+  afl->adarare_dict_taken_total = 0;
   afl->bandit_win_havoc_ops = 0;
   afl->bandit_win_dict_ops = 0;
   afl->bandit_last_havoc_ops = 0;
@@ -1134,5 +1139,32 @@ void afl_states_clear_screen(void) {
 void afl_states_request_skip(void) {
 
   LIST_FOREACH(&afl_states, afl_state_t, { el->skip_requested = 1; });
+
+}
+
+u8 adarare_allow_dict_mut(afl_state_t *afl, u32 pct) {
+
+  u32 r = afl ? rand_below(afl, 100) : (u32)(get_cur_time() % 100);
+  if (afl) {
+    afl->adarare_dict_attempts_win++;
+    afl->adarare_dict_attempts_total++;
+  }
+  if (pct >= 100) {
+    if (afl) {
+      afl->adarare_dict_taken_win++;
+      afl->adarare_dict_taken_total++;
+    }
+    return 1;
+  }
+  if (pct == 0) { return 0; }
+
+  if (r < pct) {
+    if (afl) {
+      afl->adarare_dict_taken_win++;
+      afl->adarare_dict_taken_total++;
+    }
+    return 1;
+  }
+  return 0;
 
 }

@@ -2430,6 +2430,9 @@ int main(int argc, char **argv_orig, char **envp) {
           afl->out_dir);
 
   }
+  bandit_set_log_dir(&afl->bandit, (const char *)afl->out_dir);
+  bandit_set_owner(&afl->bandit, afl);
+  adarare_write_config_snapshot(afl);
 
   #ifdef HAVE_AFFINITY
   bind_to_free_cpu(afl);
