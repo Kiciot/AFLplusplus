@@ -1637,7 +1637,8 @@ skip_interest:
       }
 
       if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
-        --afl->stage_max;
+        /* Keep stage_max consistent when bandit gating skips dict mutation. */
+        if (afl->stage_max) --afl->stage_max;
         continue;
       }
 
@@ -1699,7 +1700,8 @@ skip_interest:
       }
 
       if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
-        --afl->stage_max;
+        /* Keep stage_max consistent when bandit gating skips dict mutation. */
+        if (afl->stage_max) --afl->stage_max;
         continue;
       }
 
@@ -1775,7 +1777,8 @@ skip_user_extras:
       }
 
       if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
-        --afl->stage_max;
+        /* Keep stage_max consistent when bandit gating skips dict mutation. */
+        if (afl->stage_max) --afl->stage_max;
         continue;
       }
 
@@ -1837,7 +1840,8 @@ skip_user_extras:
       }
 
       if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
-        --afl->stage_max;
+        /* Keep stage_max consistent when bandit gating skips dict mutation. */
+        if (afl->stage_max) --afl->stage_max;
         continue;
       }
 
@@ -4812,6 +4816,8 @@ skip_interest:
   afl->stage_short = "ext_UO";
   afl->stage_cur = 0;
   afl->stage_max = afl->extras_cnt * len;
+  u32 dict_gate_pct =
+      afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
 
   afl->stage_val_type = STAGE_VAL_NONE;
 
@@ -4843,6 +4849,14 @@ skip_interest:
                   EFF_SPAN_ALEN(i, afl->extras[j].len))) {
 
         --afl->stage_max;
+        continue;
+
+      }
+
+      if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+
+        /* Keep stage_max consistent when bandit gating skips dict mutation. */
+        if (afl->stage_max) --afl->stage_max;
         continue;
 
       }
@@ -4880,6 +4894,7 @@ skip_interest:
   afl->stage_short = "ext_UI";
   afl->stage_cur = 0;
   afl->stage_max = afl->extras_cnt * (len + 1);
+  dict_gate_pct = afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
 
   orig_hit_cnt = new_hit_cnt;
 
@@ -4895,6 +4910,14 @@ skip_interest:
       if (len + afl->extras[j].len > MAX_FILE) {
 
         --afl->stage_max;
+        continue;
+
+      }
+
+      if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+
+        /* Keep stage_max consistent when bandit gating skips dict mutation. */
+        if (afl->stage_max) --afl->stage_max;
         continue;
 
       }
@@ -4941,6 +4964,7 @@ skip_user_extras:
   afl->stage_short = "ext_AO";
   afl->stage_cur = 0;
   afl->stage_max = MIN(afl->a_extras_cnt, (u32)USE_AUTO_EXTRAS) * len;
+  dict_gate_pct = afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
 
   afl->stage_val_type = STAGE_VAL_NONE;
 
@@ -4963,6 +4987,14 @@ skip_user_extras:
                   EFF_SPAN_ALEN(i, afl->a_extras[j].len))) {
 
         --afl->stage_max;
+        continue;
+
+      }
+
+      if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+
+        /* Keep stage_max consistent when bandit gating skips dict mutation. */
+        if (afl->stage_max) --afl->stage_max;
         continue;
 
       }
@@ -5001,6 +5033,7 @@ skip_user_extras:
   afl->stage_short = "ext_AI";
   afl->stage_cur = 0;
   afl->stage_max = afl->a_extras_cnt * (len + 1);
+  dict_gate_pct = afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
 
   orig_hit_cnt = new_hit_cnt;
 
@@ -5016,6 +5049,14 @@ skip_user_extras:
       if (len + afl->a_extras[j].len > MAX_FILE) {
 
         --afl->stage_max;
+        continue;
+
+      }
+
+      if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+
+        /* Keep stage_max consistent when bandit gating skips dict mutation. */
+        if (afl->stage_max) --afl->stage_max;
         continue;
 
       }
@@ -5608,10 +5649,16 @@ pacemaker_fuzzing:
                  present in the dictionaries. */
 
               r -= 16;
+              dict_gate_pct =
+                  afl->bandit_dict_enable ? afl->adarare_dict_prob : 100;
 
               if (r == 0 && (afl->extras_cnt || afl->a_extras_cnt)) {
 
                 /* Overwrite bytes with an extra. */
+                if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+                  /* Skip only this dict operator; do not exit outer havoc loop. */
+                  break;
+                }
 
                 if (!afl->extras_cnt ||
                     (afl->a_extras_cnt && rand_below(afl, 2))) {
@@ -5666,6 +5713,10 @@ pacemaker_fuzzing:
                 u32 use_extra, extra_len,
                     insert_at = rand_below(afl, temp_len + 1);
                 u8 *ptr;
+                if (!adarare_allow_dict_mut(afl, dict_gate_pct)) {
+                  /* Skip only this dict operator; do not exit outer havoc loop. */
+                  break;
+                }
 
                 /* Insert an extra. Do the same dice-rolling stuff as for the
                   previous case. */

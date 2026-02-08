@@ -1,191 +1,115 @@
-# Bandit Value Model (AFL++)
+# AdaRare Bandit Scheduler (AFL++ Integration)
 
-This document describes the bandit value model, reward formulas, and
-experimental controls for the minimal-intrusion scheduling enhancements.
+This document describes the **AdaRare** scheduler, a lightweight, window-based **Contextual Multi-Armed Bandit (CMAB)** designed to dynamically optimize the fuzzing strategy. It balances coverage expansion (Exploration), rarity discovery (Exploitation), and execution speed (Throughput).
 
-## Value Model
+## Core Model
 
-Notation:
-- NEW: set of newly covered bitmap slots for the current execution.
-- hit[i]: count of times slot i was newly discovered (slot-level rarity).
-- bandit_epoch: window counter incremented on each bandit window rotation.
-- last_seen[i]: last bandit_epoch when slot i contributed as NEW coverage.
-- dt: bandit_epoch - last_seen[i].
+The scheduler treats the fuzzing process as a sequential decision problem. Time is divided into discrete **windows** (default 1000ms). At the end of each window, the scheduler observes the reward, updates its internal models, and selects the strategy (Arm) for the next window.
 
-bandit_epoch is derived from fuzz-runtime windows (not wall-clock time) for
-reproducibility; last_seen[i] is only updated when the edge contributes as NEW
-coverage.
+### 1. Contextual State ()
 
-Rarity:
-- rarity(i) = 1 / sqrt(hit[i] + 1)
+The LinUCB model predicts the potential reward of an arm based on the current state of the fuzzing campaign. The state is a **6-dimensional vector** derived from the *previous* window's metrics:
 
-Temporal novelty (optional):
-- temporal(i) = log(1 + dt)
-  or
-- temporal(i) = 1 - exp(-lambda * dt)
+| Dim | Metric | Description | Formula Logic |
+| --- | --- | --- | --- |
+| **0** | **New Bits Rate** | Speed of coverage discovery. | `log(1 + bits_per_sec) * 0.2` |
+| **1** | **Rarity Rate** | Accumulation of rare edges (inverse hit counts). | `log(1 + rarity_mass_per_sec) * 0.5` |
+| **2** | **Throughput** | Current execution speed. | `log(1 + execs_per_sec) * 0.2` |
+| **3** | **Queue Density** | Ratio of queued items to total corpus. | `log(1 + queued / corpus) * 1.0` |
+| **4** | **Favored Ratio** | Proportion of "favored" paths in queue. | `(favored / queued) * 2.0` |
+| **5** | **Timeout Rate** | Stability of the target. | `log(1 + timeouts / execs) * 1.0` |
 
-Value for one execution:
-- delta_novelty = sum_{i in NEW} rarity(i) * temporal(i)
+### 2. Adaptive Reward System ()
 
-Complexity gate (optional):
-- exec_us gate (default):
-  norm_exec = exec_us / max(1, ema_exec_us)
-  gate = 1 / (1 + rho * max(0, norm_exec - 1))
-  ema_exec_us is an EMA over exec_us (alpha≈0.01) to keep the baseline stable.
-- path_len gate:
-  len = count(nonzero slots)
-  gate = 1 / len^alpha
-- clamp: gate is clamped to [gate_min, 1.0]; gate_min defaults to 0.05 and
-  is configurable.
+The reward quantifies how "good" a window was. It uses a **Tanh-based** formula with **Dynamic P90 Scaling** to normalize diverse metric scales (e.g., finding 1 bit vs 100 bits) into a bounded `[0, 1]` range.
 
-When enabled, gate is applied to the novelty value:
-- delta_novelty <- delta_novelty * gate
-bandit_last_gate reports the average gate over NEW-coverage events in the last
-window (falls back to 1.0 when there were no NEW events or gate=none), and
-bandit_gate_samples records how many NEW events contributed.
-Exec-level gate observability for dense rewards:
-- bandit_last_gate_execavg: average gate across executions in the last window
-  (falls back to 1.0 if no samples or gate=none).
-- bandit_gate_exec_samples: number of executions sampled for gate averaging.
+**Formula:**
 
-When using `rarity_mass`, the per-exec mass is the sum over executed slots of
-1/sqrt(hit+1); it is dense (no NEW required) and still subject to the gate.
-- bandit_last_rarity_samples: number of executions contributing rarity_mass in
-  the last window (typically matches exec count when rarity_mass is enabled).
 
-Rarity normalization (density):
-- AFL_BANDIT_RARITY_NORM=path_len (default) uses rarity_mass / max(1,path_len)
-  per exec to reduce long-path bias; `none` keeps the raw sum.
-- Stats: bandit_rarity_norm, bandit_last_path_len_avg, bandit_last_rarity_density.
+* ** / **: The raw rates (per second) of finding new coverage and rarity mass, amplified by the **Gate Factor**.
+* ** /  (Dynamic Scaling)**: These are not fixed constants. The system uses **Reservoir Sampling** to estimate the **90th percentile (P90)** of rates observed over recent history. This ensures the `tanh` function remains sensitive regardless of whether the fuzzer is finding 1 path/sec or 1000 paths/sec.
+* ** (Penalty)**: Penalizes arms that drop below the historical Exponential Moving Average (EMA) of execution speed.
+* **Gate Factor**: A multiplier derived from execution signals (e.g., path length or execution time). Stronger signals boost the reward.
 
-Havoc vs dict usage (per window):
-- bandit_last_havoc_ops: count of havoc mutation attempts
-- bandit_last_dict_ops: count of dict-based mutations applied
-- bandit_last_dict_ratio: bandit_last_dict_ops / bandit_last_havoc_ops
+### 3. Arm Architecture
 
-## Reward
+The scheduler controls fuzzing parameters via 6 distinct "Arms":
 
-Per-window reward is dense and rate-based:
+* **A1 - A5**: Concrete strategies with different energy/mutation characteristics.
+* **A6 (Hierarchical Mix)**: A meta-arm. When selected, it probabilistically delegates execution to **Arm 1** or **Arm 2** based on a configured probability (`mix_p`).
+* *Off-Policy Update*: When A6 runs, the system updates the models for **both** A6 and the effective arm (A1 or A2), maximizing data efficiency.
 
-Base rate (choose one):
-- event: win_new_cov / max(1, win_execs)
-- bits:  win_new_bits / max(1, win_execs)
-- novelty: win_novelty / max(1, win_execs)
-- rarity_mass: win_rarity_mass / max(1, win_execs) where win_rarity_mass is
-  the per-exec sum of 1/sqrt(hit+1) over executed slots (dense reward, no NEW
-  required)
 
-Formula options:
-- rate:
-  reward = base_rate
-- rate_cost:
-  reward = base_rate - beta * timeout_rate - gamma * slow_rate
-  timeout_rate = win_timeouts / max(1, win_execs)
-  slow_rate = win_slow_execs / max(1, win_execs)
 
-Discounted-UCB (non-stationary):
-- AFL_BANDIT_DISCOUNT in (0,1]; default 1.0 (no discount).
-- On each window rotation, arm pulls and rewards are multiplied by the discount
-  factor to forget stale history.
+## Selection Policy
 
-Warm-up windows (cold-start protection):
-- AFL_BANDIT_WARMUP_WINDOWS=<u64>, default 10.
-- During warm-up, arms are not changed, multipliers stay 1.0, and dict
-  probability stays at the baseline default; rewards are still recorded.
-- Stats: bandit_warmup_windows, bandit_in_warmup.
+The scheduler selects the next arm using a priority chain:
+
+1. **Warmup**: Round-robin selection for the first `N` windows (default 20) to initialize statistics.
+2. **Explicit Revisit**: If an arm hasn't been selected for `T` milliseconds (default 30 mins), it is forced to run. This prevents starvation and ensures models don't drift too far from reality.
+3. **LinUCB (Ridge Regression)**:
+* Computes the estimated reward: 
+* Computes the uncertainty (exploration bonus): 
+* Selects 
+* *Safety*: Includes fallbacks to standard UCB1 if matrix inversion fails.
+
+
+
+## Non-Stationary Handling
+
+Fuzzing is a non-stationary process (finding bugs gets harder over time). AdaRare handles this via:
+
+* **Discounting**: Every window, historical data (Matrix , Vector , Pulls) is multiplied by  (default 0.99). Recent observations matter more.
+* **Matrix Clamping**: The Ridge Regression matrix  is periodically checked. If values explode,  and  are synchronously rescaled to maintain numerical stability without losing learned correlations.
 
 ## Environment Variables
 
-Bandit core:
-- AFL_BANDIT=1
-- AFL_BANDIT_WINDOW_MS=<ms>
-- AFL_BANDIT_REWARD=event|bits|novelty
-- AFL_BANDIT_REWARD=rarity_mass (dense, no NEW required)
-- AFL_BANDIT_REWARD_FORMULA=rate|rate_cost
-- AFL_BANDIT_BETA=<float>
-- AFL_BANDIT_GAMMA=<float>
+Configuration is handled via environment variables.
 
-Temporal novelty:
-- AFL_BANDIT_TEMPORAL=0|1
-- AFL_BANDIT_LAMBDA=<float>  (0 uses log(1+dt))
+| Variable | Default | Description |
+| --- | --- | --- |
+| `AFL_ADARARE_WINDOW_MS` | 1000 | Duration of one decision window (ms). |
+| `AFL_ADARARE_ALPHA` | 0.5 | LinUCB exploration parameter. Higher = more exploration. |
+| `AFL_ADARARE_RIDGE` | 0.1 | Ridge regression lambda (regularization). |
+| `AFL_ADARARE_REVISIT_MS` | 1800000 | Time (ms) before forcing an arm revisit (30 mins). |
+| `AFL_ADARARE_MIX_P` | 0.5 | Probability split for Arm 6 (0.0 - 1.0). |
+| `AFL_ADARARE_GATE_MULT` | 0.05 | Strength of the Gate Amplification bonus. |
+| `AFL_ADARARE_REWARD_ALPHA` | 0.6 | Weight for Edge coverage reward. |
+| `AFL_ADARARE_REWARD_BETA` | 0.3 | Weight for Rarity mass reward. |
+| `AFL_ADARARE_REWARD_GAMMA` | 0.1 | Weight for Throughput penalty. |
+| `AFL_ADARARE_DICT_ENABLE` | 1 | Enable dynamic dictionary probability control. |
+| `AFL_ADARARE_VERIFY` | 0 | Enable verbose audit logging (`.adarare_verify.log`). |
 
-Complexity gate:
-- AFL_BANDIT_GATE=none|exec_us|path_len
-- AFL_BANDIT_RHO=<float>    (exec_us gate strength)
-- AFL_BANDIT_ALPHA=<float>  (path_len exponent)
-- AFL_BANDIT_GATE_MIN=<float> (minimum gate clamp, default 0.05)
-  (AFL_BANDIT_GATE=none forces gate=1.0)
-- AFL_BANDIT_DISCOUNT=<float in (0,1]> (optional discounting)
-- AFL_BANDIT_WARMUP_WINDOWS=<u64> (default 10)
-- AFL_BANDIT_RARITY_NORM=none|path_len (default path_len)
-- CmpLog observability (coarse):
-  - bandit_cmplog_enabled: 1 if cmplog mode/env detected.
-  - bandit_last_cmplog_execs: cmplog executions counted per bandit window
-    (approximate, from cmplog path invocations).
+## Observability
 
-## Observability (fuzzer_stats)
+The scheduler produces rich telemetry in the output directory:
 
-Key fields (stable schema):
-- bandit_last_reward
-- bandit_last_rarity_mass
-- bandit_last_rarity_samples
-- bandit_last_novelty
-- bandit_last_new_bits
-- bandit_last_execs
-- bandit_last_time_us
-- bandit_last_timeouts
-- bandit_last_slow_execs
-- bandit_reward_type
-- bandit_reward_formula
-- bandit_hit_max
-- bandit_epoch
-- bandit_temporal
-- bandit_lambda
-- bandit_gate
-- bandit_gate_rho
-- bandit_gate_alpha
-- bandit_last_gate
-- bandit_gate_samples
-- bandit_last_gate_execavg
-- bandit_gate_exec_samples
-- bandit_gate_min
-- bandit_exec_us_ema
-- bandit_rarity_norm
-- bandit_last_path_len_avg
-- bandit_last_rarity_density
-- bandit_build_id
-- bandit_discount
-- bandit_warmup_windows
-- bandit_in_warmup
-- bandit_cmplog_enabled
-- bandit_last_cmplog_execs
-- bandit_last_havoc_ops
-- bandit_last_dict_ops
-- bandit_last_dict_ratio
+### 1. `.adarare_config.json`
 
-Overhead estimates:
-- bandit_rotate_us_last
-- bandit_rotate_us_avg
-- bandit_novelty_us_last
-- bandit_novelty_us_avg
-- bandit_novelty_samples
+A static snapshot of the configuration parameters and build ID used for the session.
 
-These allow reporting per-window decision cost and approximate novelty
-calculation overhead.
+### 2. `.adarare_bandit.csv`
 
-## Ablation Controls
+A real-time log updated every window. Key columns:
 
-Recommended ablations:
-- Disable bandit: AFL_BANDIT=0
-- Reward modes: AFL_BANDIT_REWARD=event|bits|novelty
-- Reward formula: AFL_BANDIT_REWARD_FORMULA=rate|rate_cost
-- Temporal novelty: AFL_BANDIT_TEMPORAL=0
-- Complexity gate off: AFL_BANDIT_GATE=none
+* `ts_ms`: Timestamp.
+* `arm_id`: Selected arm (0-5).
+* `effective_arm`: The actual strategy run (resolves A6).
+* `reward`: The final normalized reward [0,1].
+* `p90_score`: Current P90 threshold used for scaling.
+* `edges_term`, `rarity_term`: Components of the reward.
+* `x_vc`, `x_vr`, ...: The 6 context vector values.
+* `ucb_score`: The score that resulted in the selection.
 
-## Toy Target (Quick Sanity)
+## Integration Check
 
-One-command example (after build):
-- AFL_BANDIT=1 AFL_EXIT_ON_TIME=60 ./afl-fuzz -i experiments/toy/inputs \
-  -o out/toy -- experiments/toy/target @@
+To verify the bandit is active, run AFL++ and check for the existence of the CSV log:
 
-See experiments/run_toy.sh for a convenience wrapper.
+```bash
+# Example Run
+AFL_ADARARE_WINDOW_MS=500 ./afl-fuzz -i in -o out -- ./target @@
+
+# Verify
+tail -f out/default/.adarare_bandit.csv
+
+```
