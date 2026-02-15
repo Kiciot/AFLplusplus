@@ -149,27 +149,27 @@
 
 #define BANDIT_CTX_DIM 6
 #define BANDIT_SCORE_SAMPLE_N 1024
-#define BANDIT_P90_MIN_SAMPLES 32
+#define BANDIT_P90_MIN_SAMPLES 64
 
 /* Normalization Sensitivity */
 #define BANDIT_LOG_SCALE_FACTOR 0.2 
 
 /* Gate Bonus: 5% boost per log-unit of gate value */
-#define BANDIT_GATE_MULTIPLIER 0.05
-#define BANDIT_GATE_CAP 1.25
+#define BANDIT_GATE_MULTIPLIER 0.08
+#define BANDIT_GATE_CAP 1.5
 
 /* Explicit Revisit Policy: 30 minutes default. */
-#define BANDIT_REVISIT_TIME_MS (30ULL * 60ULL * 1000ULL)
+#define BANDIT_REVISIT_TIME_MS (10ULL * 60ULL * 1000ULL)
 
 /* Revisit Score (Case B) */
-#define BANDIT_REVISIT_SCORE 1.7
+#define BANDIT_REVISIT_SCORE 1.4
 
 /* Safety Constraints */
 #define BANDIT_PULLS_EPSILON 1e-6
 #define BANDIT_BONUS_CAP 2.0
 
 /* Keep interval comfortably above BANDIT_P90_MIN_SAMPLES so P90 scaling stays active. */
-#define BANDIT_RESCALE_INTERVAL 256
+#define BANDIT_RESCALE_INTERVAL 360
 
 #define BANDIT_MATRIX_VAL_CAP 1.0e12
 #define BANDIT_MATRIX_RESCALE_FACTOR 1.0e-6 /* Keep scaled entries in same order
