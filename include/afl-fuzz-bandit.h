@@ -4,6 +4,7 @@
 #include "types.h"
 
 #define AFL_BANDIT_DEFAULT_ARMS 4U
+#define AFL_BANDIT_MAX_ARMS 6U
 #define AFL_BANDIT_DEFAULT_WINDOW_MS 5000ULL
 #define AFL_BANDIT_MAX_MULTIPLIER 2.5
 #define AFL_BANDIT_DICT_PROB_DEFAULT 20U
@@ -85,6 +86,9 @@ typedef struct bandit_state {
   double total_rounds;
   u64 window_ms;
   u64 win_start_time;
+  u64 win_arm_ms[AFL_BANDIT_MAX_ARMS];
+  u64 win_last_ts;
+  u32 win_last_arm;
   u64 win_new_cov;
   u64 win_new_bits;
   u64 win_execs;
@@ -122,6 +126,9 @@ typedef struct bandit_state {
   double gate_multiplier;
   double gate_cap;
   u64    revisit_time_ms;
+  u64    last_improve_ms;
+  u64    last_revisit_ms;
+  u32    stagnation_windows;
   double rarity_decay;
   double rarity_ema;
   double mix_p;
