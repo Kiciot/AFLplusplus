@@ -59,6 +59,8 @@ typedef struct bandit_arm_state {
   u64    selections;   /* Non-discounted selection count. */
   u64    last_selected_round; /* Last global selection round. */
   u64    last_selected_ms;    /* Last selection time (ms). */
+  double last_thrpt;          /* Last observed throughput (execs/sec). */
+  u64    last_seen_ms;        /* Timestamp of last throughput update (ms). */
   double A[6][6];      /* LinUCB design matrix per arm. */
   double b[6];         /* LinUCB target vector per arm. */
 
@@ -74,8 +76,8 @@ typedef struct bandit_state {
   u32 current_arm_eff; /* Frozen effective arm for current window (A6 -> A1/A2). */
   bandit_arm_state_t *arms;
   void  *score_res;        /* Reservoir for reward samples */
-  void  *edges_rate_res;   /* Reservoir for edges/sec */
-  void  *rarity_rate_res;  /* Reservoir for rarity/sec */
+  void  *edges_rate_res;   /* Per-arm reservoir array for edges/sec */
+  void  *rarity_rate_res;  /* Per-arm reservoir array for rarity/sec */
   u8     verify_enabled;   /* Enable verification logging */
   u8     rng_seeded_from_owner; /* Whether RNG seeded from owner */
   u32    rng_log_idx;      /* Logged RNG outputs count */
@@ -101,6 +103,7 @@ typedef struct bandit_state {
   double last_reward;
   double last_raw_reward;
   double last_gate_factor;
+  double last_gate_bonus;
   u64    last_win_execs;
   u64    last_win_new_cov;
   u64    last_win_new_bits;
