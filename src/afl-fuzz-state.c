@@ -125,6 +125,9 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->bandit_dict_enable = 1;
   afl->bandit_dict_prob = AFL_BANDIT_DICT_PROB_DEFAULT;
   afl->adarare_dict_prob = AFL_BANDIT_DICT_PROB_DEFAULT;
+  afl->adarare_prefer_favored = 0;
+  afl->adarare_prefer_new = 0;
+  afl->adarare_havoc_mul_pct = 100;
   afl->adarare_dict_attempts_win = 0;
   afl->adarare_dict_taken_win = 0;
   afl->adarare_dict_attempts_total = 0;

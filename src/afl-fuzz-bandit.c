@@ -162,21 +162,56 @@
 #define BANDIT_X_CAP 3.0
 
 /* Gate Bonus: 5% boost per log-unit of gate value */
-#define BANDIT_GATE_MULTIPLIER 0.03
+#define BANDIT_GATE_MULTIPLIER 0.02
 #define BANDIT_GATE_CAP 1.15
-#define ADARARE_GATE_IN_REWARD_ONLY 1
+#define BANDIT_PROGRESS_GATE_ENABLE 1
+#define BANDIT_PROGRESS_RARITY_EPS 1e-12
+#ifndef ADARARE_ZERO_PROGRESS_PENALTY
+#define ADARARE_ZERO_PROGRESS_PENALTY 0.015
+#endif
+#ifndef ADARARE_THRPT_PEN_IF_PROGRESS
+#define ADARARE_THRPT_PEN_IF_PROGRESS 0.10
+#endif
 
 /* Pulls-based warmup before LinUCB scoring. */
 #define BANDIT_WARMUP_PULLS_PER_ARM 2.0
 
+/* Coverage-first score tie-breaks. */
+#define ADARARE_ENABLE_TIE_BREAK 1
+#define ADARARE_TIE_EPS 0.05
+#ifndef ADARARE_TIE_EPS_REL
+#define ADARARE_TIE_EPS_REL 0.015
+#endif
+#define ADARARE_EDGES_EMA_ALPHA 0.1
+#ifndef ADARARE_EARLY_EDGES_PULLS_CUTOFF
+#define ADARARE_EARLY_EDGES_PULLS_CUTOFF 200.0
+#endif
+#ifndef ADARARE_MIN_DWELL_WINDOWS
+#define ADARARE_MIN_DWELL_WINDOWS 1
+#endif
+#define ADARARE_WINDOW_MS_EARLY 4500ULL
+#define ADARARE_WINDOW_MS_LATE 8000ULL
+#define ADARARE_WINDOW_EARLY_ROUNDS 40U
+#define ADARARE_ZP_STREAK_START 3
+#define ADARARE_ZP_STEP 0.05
+#define ADARARE_ZP_FACTOR_MIN 0.80
+
 /* Stagnation controls (5s window -> 24 windows ~= 2 minutes). */
 #define BANDIT_STAG_WINDOWS 24U
 #define BANDIT_STAG_BOOST 1.35
+#define BANDIT_STAG_TREND_ALPHA 0.2
+#define BANDIT_STAG_SLOPE_ALPHA 0.25
+#define BANDIT_STAG_REWARD_SLOPE_EPS 0.002
+#define BANDIT_STAG_EDGES_SLOPE_EPS 0.005
+#define BANDIT_STAG_TREND_MIN_WINDOWS 8U
 
 /* Selection-side throughput guardrail for slow arms. */
 #define BANDIT_SEL_THRPT_GUARD 1
-#define BANDIT_THRPT_GUARD_RATIO 0.75
-#define BANDIT_THRPT_GUARD_PENALTY 0.85
+#define BANDIT_THRPT_GUARD_RATIO 0.70
+#define BANDIT_THRPT_GUARD_SOFT_K 0.35
+#define BANDIT_THRPT_GUARD_PENALTY_MIN 0.80
+#define BANDIT_THRPT_GUARD_STREAK_START 2U
+#define BANDIT_THRPT_GUARD_STREAK_STEP 0.03
 
 /* Stagnation-triggered revisit cooldown. */
 #define BANDIT_REVISIT_COOLDOWN_MS (3ULL * 60ULL * 1000ULL)
@@ -194,14 +229,55 @@
                                                rescale; diagonal is clamped to
                                                ridge_lambda to keep conditioning. */
 /* Keep ETA at 1.0 unless selections accounting is redesigned for fractional credit. */
-#define BANDIT_A6_OFFPOLICY_ETA 1.0
+#define ADARARE_A6_BASE_ETA 1.0
+#define ADARARE_ENABLE_ADAPTIVE_A6 1
+#define ADARARE_A6_MIX_EMA_ALPHA 0.2
+#define ADARARE_A6_TOPK 2
+#define ADARARE_A6_SOFTMAX_TEMP 1.20
+#define ADARARE_MIX_P_MIN 0.15
+#define ADARARE_MIX_P_MAX 0.85
+#define ADARARE_MIX_UPDATE_INTERVAL 4U
+#ifndef ADARARE_A6_MIX_UPDATE_MIN_QSUM
+#define ADARARE_A6_MIX_UPDATE_MIN_QSUM 0.05
+#endif
+#ifndef ADARARE_A6_MIX_RETURN_RATE
+#define ADARARE_A6_MIX_RETURN_RATE 0.02
+#endif
+#ifndef ADARARE_A6_MIX_EMA
+#define ADARARE_A6_MIX_EMA 0.20
+#endif
+#define ADARARE_ENABLE_IPS 1
+#define ADARARE_IPS_CLIP 2.0
+#define ADARARE_IPS_PI_EPS 1e-6
+#ifndef ADARARE_ENABLE_IPS_STATS
+#define ADARARE_ENABLE_IPS_STATS 1
+#endif
+#ifndef ADARARE_ENABLE_IPS_MODEL
+#define ADARARE_ENABLE_IPS_MODEL 0
+#endif
+#ifndef ADARARE_IPS_MODEL_CLIP
+#define ADARARE_IPS_MODEL_CLIP 1.0
+#endif
+#define BANDIT_BUILD_ID_AUDIT 1
+
+#ifndef ADARARE_BUILD_ID
+#define ADARARE_BUILD_ID "unknown"
+#endif
+static const char adarare_build_id_anchor[] __attribute__((used)) =
+    "adarare-build:" ADARARE_BUILD_ID;
 
 /* --- Helper Structures --- */
 
 static u8 bandit_dbg = 0;
 static u8 bandit_dbg_inited = 0;
 static u8 bandit_dbg_fp_inited = 0;
+static u8 bandit_build_id_logged = 0;
 static FILE *bandit_dbg_fp = NULL;
+
+static inline const char *adarare_build_id_effective(void) {
+  const char *env_build_id = getenv("AFL_ADARARE_BUILD_ID");
+  return (env_build_id && env_build_id[0]) ? env_build_id : ADARARE_BUILD_ID;
+}
 
 typedef struct {
     double samples[BANDIT_SCORE_SAMPLE_N];
@@ -282,9 +358,120 @@ static void json_print_escaped(FILE *fp, const char *str) {
 
 static inline u32 bandit_default_arm_count(void) { return AFL_BANDIT_MAX_ARMS; }
 
+typedef enum {
+  BANDIT_ENERGY_LOG = 0,
+  BANDIT_ENERGY_LINEAR_SOFT,
+  BANDIT_ENERGY_LINEAR_MED,
+  BANDIT_ENERGY_THRESHOLD,
+  BANDIT_ENERGY_FLAT
+} bandit_energy_mode_t;
+
+typedef struct {
+  const char *name;
+  u32 dict_prob;
+  double havoc_stack_mul;
+  s8 prefer_favored;
+  u8 prefer_new;
+  u8 trim_policy; /* 0 keep, 1 force disable trim, 2 force enable trim */
+  bandit_energy_mode_t energy_boost_mode;
+  double w_alpha;
+  double w_beta;
+  double w_gamma;
+  double zp_penalty_mul;
+} bandit_arm_cfg_t;
+
+static const bandit_arm_cfg_t kArmCfg[AFL_BANDIT_MAX_ARMS] = {
+    [BANDIT_ARM_A1] = {
+        .name = "A1 throughput-first havoc",
+        .dict_prob = 5,
+        .havoc_stack_mul = 1.20,
+        .prefer_favored = 0,
+        .prefer_new = 1,
+        .trim_policy = 0,
+        .energy_boost_mode = BANDIT_ENERGY_LINEAR_SOFT,
+        .w_alpha = 0.55,
+        .w_beta = 0.15,
+        .w_gamma = 0.30,
+        .zp_penalty_mul = 1.10,
+    },
+    [BANDIT_ARM_A2] = {
+        .name = "A2 dictionary-heavy",
+        .dict_prob = 45,
+        .havoc_stack_mul = 1.05,
+        .prefer_favored = 0,
+        .prefer_new = 0,
+        .trim_policy = 0,
+        .energy_boost_mode = BANDIT_ENERGY_LOG,
+        .w_alpha = 0.35,
+        .w_beta = 0.50,
+        .w_gamma = 0.15,
+        .zp_penalty_mul = 0.90,
+    },
+    [BANDIT_ARM_A3] = {
+        .name = "A3 cmplog-synergy",
+        .dict_prob = 20,
+        .havoc_stack_mul = 1.10,
+        .prefer_favored = 1,
+        .prefer_new = 0,
+        .trim_policy = 0,
+        .energy_boost_mode = BANDIT_ENERGY_LINEAR_MED,
+        .w_alpha = 0.45,
+        .w_beta = 0.40,
+        .w_gamma = 0.15,
+        .zp_penalty_mul = 1.00,
+    },
+    [BANDIT_ARM_A4] = {
+        .name = "A4 favored exploitation",
+        .dict_prob = 12,
+        .havoc_stack_mul = 1.18,
+        .prefer_favored = 1,
+        .prefer_new = 0,
+        .trim_policy = 0,
+        .energy_boost_mode = BANDIT_ENERGY_THRESHOLD,
+        .w_alpha = 0.70,
+        .w_beta = 0.20,
+        .w_gamma = 0.10,
+        .zp_penalty_mul = 1.00,
+    },
+    [BANDIT_ARM_A5] = {
+        .name = "A5 queue exploration",
+        .dict_prob = 8,
+        .havoc_stack_mul = 0.95,
+        .prefer_favored = -1,
+        .prefer_new = 1,
+        .trim_policy = 0,
+        .energy_boost_mode = BANDIT_ENERGY_FLAT,
+        .w_alpha = 0.40,
+        .w_beta = 0.35,
+        .w_gamma = 0.25,
+        .zp_penalty_mul = 0.60,
+    },
+    [BANDIT_ARM_A6] = {
+        .name = "A6 top-k portfolio",
+        .dict_prob = 15,
+        .havoc_stack_mul = 1.00,
+        .prefer_favored = 0,
+        .prefer_new = 0,
+        .trim_policy = 0,
+        .energy_boost_mode = BANDIT_ENERGY_LOG,
+        .w_alpha = 0.75,
+        .w_beta = 0.20,
+        .w_gamma = 0.05,
+        .zp_penalty_mul = 1.00,
+    },
+};
+
+static inline const bandit_arm_cfg_t *bandit_arm_cfg_for_arm(u32 arm_idx) {
+  if (arm_idx >= AFL_BANDIT_MAX_ARMS) return NULL;
+  return &kArmCfg[arm_idx];
+}
+
 static inline double bandit_multiplier_for_arm(u32 arm_idx) {
-  (void)arm_idx;
-  return 1.0;
+  const bandit_arm_cfg_t *cfg = bandit_arm_cfg_for_arm(arm_idx);
+  if (!cfg || !isfinite(cfg->havoc_stack_mul) || cfg->havoc_stack_mul <= 0.0) {
+    return 1.0;
+  }
+  return cfg->havoc_stack_mul;
 }
 
 static u64 xorshift64(u64 *state) {
@@ -298,6 +485,19 @@ static u64 xorshift64(u64 *state) {
 
 static inline u64 bandit_now_ms(void) {
   return get_cur_time_us() / 1000;
+}
+
+static inline u64 bandit_current_window_ms(const bandit_state_t *bandit) {
+  if (!bandit) return AFL_BANDIT_DEFAULT_WINDOW_MS;
+
+  u64 cur = bandit->window_ms ? bandit->window_ms : AFL_BANDIT_DEFAULT_WINDOW_MS;
+  if (bandit->total_selections < ADARARE_WINDOW_EARLY_ROUNDS) {
+    cur = ADARARE_WINDOW_MS_EARLY;
+  } else {
+    cur = ADARARE_WINDOW_MS_LATE;
+  }
+  if (cur < 100ULL) { cur = 100ULL; }
+  return cur;
 }
 
 static inline void bandit_dbg_init(void) {
@@ -422,16 +622,120 @@ static inline u32 bandit_pick_revisit_arm(const bandit_state_t *bandit) {
 
 }
 
+static inline double bandit_a6_choice_prob(const bandit_state_t *bandit,
+                                           u32 arm) {
+
+  if (!bandit) return 0.0;
+  for (u32 k = 0; k < ADARARE_A6_TOPK && k < AFL_BANDIT_MAX_ARMS; ++k) {
+    if (bandit->a6_topk[k] == arm) {
+      double p = bandit->a6_topk_prob[k];
+      if (!isfinite(p) || p < 0.0) return 0.0;
+      return p;
+    }
+  }
+  return 0.0;
+
+}
+
+static void bandit_build_a6_topk(bandit_state_t *bandit) {
+
+  if (!bandit || !bandit->arms || !bandit->num_arms) return;
+
+  double qvals[ADARARE_A6_TOPK];
+  u32 filled = 0;
+  for (u32 k = 0; k < ADARARE_A6_TOPK && k < AFL_BANDIT_MAX_ARMS; ++k) {
+    bandit->a6_topk[k] = 0;
+    bandit->a6_topk_prob[k] = 0.0;
+    qvals[k] = -DBL_MAX;
+  }
+
+  for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
+    if (i == BANDIT_ARM_A6) continue;
+
+    double q = bandit_arm_mean_reward(&bandit->arms[i]);
+    if (!isfinite(q)) q = 0.0;
+
+    u32 pos = filled;
+    while (pos > 0 && q > qvals[pos - 1]) {
+      pos--;
+    }
+
+    if (pos >= ADARARE_A6_TOPK) {
+      if (filled < ADARARE_A6_TOPK) filled++;
+      continue;
+    }
+
+    u32 limit = (filled < ADARARE_A6_TOPK) ? filled : (ADARARE_A6_TOPK - 1);
+    for (u32 j = limit; j > pos; --j) {
+      qvals[j] = qvals[j - 1];
+      bandit->a6_topk[j] = bandit->a6_topk[j - 1];
+    }
+
+    qvals[pos] = q;
+    bandit->a6_topk[pos] = i;
+    if (filled < ADARARE_A6_TOPK) filled++;
+  }
+
+  if (filled == 0) {
+    u32 fallback = 0;
+    if (fallback == BANDIT_ARM_A6 && bandit->num_arms > 1) fallback = 1;
+    if (fallback >= bandit->num_arms) fallback = 0;
+    bandit->a6_topk[0] = fallback;
+    qvals[0] = 0.0;
+    filled = 1;
+  }
+
+  double temp = ADARARE_A6_SOFTMAX_TEMP;
+  if (!isfinite(temp) || temp <= 1e-6) temp = 0.25;
+  double maxq = qvals[0];
+  for (u32 k = 1; k < filled; ++k) {
+    if (qvals[k] > maxq) maxq = qvals[k];
+  }
+
+  double sumw = 0.0;
+  for (u32 k = 0; k < filled; ++k) {
+    double z = (qvals[k] - maxq) / temp;
+    double w = exp(z);
+    if (!isfinite(w) || w < 0.0) w = 0.0;
+    bandit->a6_topk_prob[k] = w;
+    sumw += w;
+  }
+
+  if (!isfinite(sumw) || sumw <= 0.0) {
+    double uniform = 1.0 / (double)filled;
+    for (u32 k = 0; k < filled; ++k) {
+      bandit->a6_topk_prob[k] = uniform;
+    }
+  } else {
+    for (u32 k = 0; k < filled; ++k) {
+      bandit->a6_topk_prob[k] /= sumw;
+    }
+  }
+
+  for (u32 k = filled; k < ADARARE_A6_TOPK && k < AFL_BANDIT_MAX_ARMS; ++k) {
+    bandit->a6_topk[k] = bandit->a6_topk[0];
+    bandit->a6_topk_prob[k] = 0.0;
+  }
+
+}
+
 static void bandit_dbg_log_window(
-    const bandit_state_t *bandit, u64 now_ms, u64 win_total_ms, u32 arm_cur,
+    const bandit_state_t *bandit, u64 now_ms, u64 cur_window_ms,
+    u64 win_total_ms, u32 arm_cur,
     u32 arm_next, const double arm_weights[AFL_BANDIT_MAX_ARMS],
     const double score_pred[AFL_BANDIT_MAX_ARMS],
     const double score_bonus[AFL_BANDIT_MAX_ARMS],
     const double score_total[AFL_BANDIT_MAX_ARMS],
     const double score_guard_ratio[AFL_BANDIT_MAX_ARMS],
-    const double score_guard_factor[AFL_BANDIT_MAX_ARMS], double edges_rate,
-    double rarity_rate, double p90_edges, double p90_rarity, double scale_c1,
-    double scale_c2, u32 scale_arm, double penalty, double gate_bonus,
+    const double score_guard_factor[AFL_BANDIT_MAX_ARMS],
+    const u32 score_guard_streak[AFL_BANDIT_MAX_ARMS],
+    const double score_zp_factor[AFL_BANDIT_MAX_ARMS],
+    const u8 score_zp_applied[AFL_BANDIT_MAX_ARMS], u32 tie_break_hits,
+    double edges_rate, double rarity_rate, double edges_per_exec,
+    double rarity_per_exec, double p90_edges, double p90_rarity, double scale_c1,
+    double scale_c2, u32 scale_arm, double penalty, double gate_factor,
+    double gate_bonus, double gate_bonus_final, double zero_prog_pen,
+    u8 has_progress, u8 stag_bonus_boost, u8 dwell_blocked,
     double raw_reward, double final_reward, u8 forced_revisit) {
 
   bandit_dbg_init();
@@ -446,22 +750,51 @@ static void bandit_dbg_log_window(
 
   fprintf(dbg_out,
           "[bandit dbg] now_ms=%llu window_ms=%llu arm_cur=%u arm_next=%u "
-          "arm_eff=%u warmup=%u stag_windows=%u forced_revisit=%u "
-          "win_total_ms=%llu w_sum=%.4f new_cov=%llu new_bits=%llu\n",
-          (unsigned long long)now_ms, (unsigned long long)bandit->window_ms,
+          "arm_eff=%u warmup=%u stag_windows=%u trend_stag=%u "
+          "slope_r=%.6f slope_e=%.6f stag_bonus_boost=%u forced_revisit=%u "
+          "win_total_ms=%llu w_sum=%.4f new_cov=%llu new_bits=%llu "
+          "clamp_hi=%u guard_hits=%u tie_win=%u tie_total=%llu reward_zero=%u "
+          "dwell_windows=%u dwell_blocked=%u\n",
+          (unsigned long long)now_ms, (unsigned long long)cur_window_ms,
           arm_cur, arm_next, bandit->current_arm_eff, (unsigned)bandit->in_warmup,
-          bandit->stagnation_windows, forced_revisit,
+          bandit->stagnation_windows, (unsigned)bandit->stag_trend_active,
+          bandit->stag_slope_reward, bandit->stag_slope_edges,
+          (unsigned)stag_bonus_boost, forced_revisit,
           (unsigned long long)win_total_ms, wsum,
           (unsigned long long)bandit->win_new_cov,
-          (unsigned long long)bandit->win_new_bits);
+          (unsigned long long)bandit->win_new_bits, bandit->last_win_clamp_hi,
+          bandit->last_win_guard_hits, tie_break_hits,
+          (unsigned long long)bandit->tie_break_hits_total,
+          (unsigned)bandit->last_win_reward_zero, bandit->dwell_windows,
+          (unsigned)dwell_blocked);
 
   fprintf(dbg_out,
           "[bandit dbg] reward edges_rate=%.6f rarity_rate=%.6f penalty=%.6f "
-          "gate_bonus=%.6f raw_reward=%.6f final_reward=%.6f "
-          "p90_arm=%u p90_edges=%.6f p90_rarity=%.6f scale_c1=%.6f "
+          "edges_per_exec=%.6f rarity_per_exec=%.6f "
+          "thrpt_pen=%.6f thrpt_pen_eff=%.6f gate_factor=%.6f gate_bonus=%.6f "
+          "zero_prog_pen=%.6f raw_reward=%.6f final_reward=%.6f "
+          "has_progress=%u gate_bonus_final=%.6f p90_arm=%u "
+          "p90_edges=%.6f p90_rarity=%.6f scale_c1=%.6f "
           "scale_c2=%.6f\n",
-          edges_rate, rarity_rate, penalty, gate_bonus, raw_reward, final_reward,
-          scale_arm, p90_edges, p90_rarity, scale_c1, scale_c2);
+          edges_rate, rarity_rate, penalty, edges_per_exec, rarity_per_exec,
+          bandit->last_thrpt_pen, bandit->last_thrpt_pen_eff, gate_factor,
+          gate_bonus, zero_prog_pen, raw_reward, final_reward,
+          (unsigned)has_progress, gate_bonus_final, scale_arm, p90_edges,
+          p90_rarity, scale_c1, scale_c2);
+
+  fprintf(dbg_out,
+          "[bandit dbg] a6 mix_p=%.6f a6_to_a1=%llu a6_to_a2=%llu "
+          "a6_q1=%.6f a6_q2=%.6f a6_pi=%.6f a6_eta_eff=%.6f "
+          "a6_eta_stats=%.6f a6_eta_model=%.6f "
+          "a6_choice=%u a6_choice_pi=%.6f "
+          "a6_k0=%u a6_k1=%u a6_k2=%u a6_p0=%.6f a6_p1=%.6f a6_p2=%.6f\n",
+          bandit->mix_p, (unsigned long long)bandit->a6_to_a1,
+          (unsigned long long)bandit->a6_to_a2, bandit->a6_q1, bandit->a6_q2,
+          bandit->last_a6_pi_eff, bandit->last_a6_eta_eff,
+          bandit->last_a6_eta_stats, bandit->last_a6_eta_model,
+          bandit->last_a6_choice, bandit->a6_choice_pi, bandit->a6_topk[0],
+          bandit->a6_topk[1], bandit->a6_topk[2], bandit->a6_topk_prob[0],
+          bandit->a6_topk_prob[1], bandit->a6_topk_prob[2]);
 
   fprintf(dbg_out,
           "[bandit dbg] x x0=%.6f x1=%.6f x2=%.6f x3=%.6f x4=%.6f x5=%.6f\n",
@@ -477,24 +810,42 @@ static void bandit_dbg_log_window(
     double score = score_total ? score_total[i] : NAN;
     double guard_ratio = score_guard_ratio ? score_guard_ratio[i] : 1.0;
     double guard_factor = score_guard_factor ? score_guard_factor[i] : 1.0;
+    u32 guard_streak = score_guard_streak ? score_guard_streak[i] : 0;
+    double zp_factor = score_zp_factor ? score_zp_factor[i] : 1.0;
+    u8 zp_applied = score_zp_applied ? score_zp_applied[i] : 0;
+    u32 zp_streak = bandit->arms[i].zp_streak;
     u32 guard_on =
         (isfinite(guard_factor) &&
          guard_factor + BANDIT_PULLS_EPSILON < 1.0) ? 1U : 0U;
     double arm_thrpt = bandit->arms[i].last_thrpt;
+    double edges_ema = bandit->arms[i].edges_ema;
+    double early_edges_ema = bandit->arms[i].early_edges_ema;
+    double edges_per_exec_ema = bandit->arms[i].edges_per_exec_ema;
+    double rarity_per_exec_ema = bandit->arms[i].rarity_per_exec_ema;
 
     if (isfinite(pred) && isfinite(bonus) && isfinite(score)) {
       fprintf(dbg_out,
               "[bandit dbg] arm=%u(%s) w=%.4f pulls=%.4f mean=%.6f "
               "pred=%.6f bonus=%.6f score=%.6f guard=%u guard_ratio=%.4f "
-              "guard_factor=%.4f arm_thrpt=%.6f\n",
+              "guard_factor=%.4f guard_streak=%u arm_thrpt=%.6f "
+              "edges_ema=%.6f early_edges_ema=%.6f "
+              "edges_per_exec_ema=%.6f rarity_per_exec_ema=%.6f "
+              "zp_streak=%u zp_factor=%.4f zp_applied=%u\n",
               i, bandit_arm_label(i), w, pulls, mean, pred, bonus, score,
-              guard_on, guard_ratio, guard_factor, arm_thrpt);
+              guard_on, guard_ratio, guard_factor, guard_streak, arm_thrpt,
+              edges_ema, early_edges_ema, edges_per_exec_ema,
+              rarity_per_exec_ema, zp_streak, zp_factor, (unsigned)zp_applied);
     } else {
       fprintf(dbg_out,
               "[bandit dbg] arm=%u(%s) w=%.4f pulls=%.4f mean=%.6f "
-              "guard=%u guard_ratio=%.4f guard_factor=%.4f arm_thrpt=%.6f\n",
+              "guard=%u guard_ratio=%.4f guard_factor=%.4f guard_streak=%u "
+              "arm_thrpt=%.6f edges_ema=%.6f early_edges_ema=%.6f "
+              "edges_per_exec_ema=%.6f rarity_per_exec_ema=%.6f "
+              "zp_streak=%u zp_factor=%.4f zp_applied=%u\n",
               i, bandit_arm_label(i), w, pulls, mean, guard_on, guard_ratio,
-              guard_factor, arm_thrpt);
+              guard_factor, guard_streak, arm_thrpt, edges_ema,
+              early_edges_ema, edges_per_exec_ema, rarity_per_exec_ema,
+              zp_streak, zp_factor, (unsigned)zp_applied);
     }
   }
 
@@ -512,12 +863,13 @@ static u32 bandit_get_random(bandit_state_t *bandit) {
   return val;
 }
 
-static const u32 bandit_dict_probs[] = {0, 10, 20, 30, 0, 10};
-
 static inline u32 bandit_effective_arm(u32 arm, u8 mix_choice) {
 
   if (arm == BANDIT_ARM_A6) {
-    return mix_choice ? BANDIT_ARM_A2 : BANDIT_ARM_A1;
+    if (mix_choice < AFL_BANDIT_MAX_ARMS && mix_choice != BANDIT_ARM_A6) {
+      return (u32)mix_choice;
+    }
+    return BANDIT_ARM_A1;
   }
 
   return arm;
@@ -693,9 +1045,10 @@ static void bandit_update_arm_model(bandit_state_t *bandit,
 }
 
 u32 bandit_dict_prob_for_arm(u32 arm_idx) {
-  u32 max_idx = (u32)(sizeof(bandit_dict_probs) / sizeof(bandit_dict_probs[0]));
-  if (arm_idx >= max_idx) { return bandit_dict_probs[max_idx - 1]; }
-  return bandit_dict_probs[arm_idx];
+  const bandit_arm_cfg_t *cfg = bandit_arm_cfg_for_arm(arm_idx);
+  if (!cfg) { return AFL_BANDIT_DICT_PROB_DEFAULT; }
+  if (cfg->dict_prob > 100U) { return 100U; }
+  return cfg->dict_prob;
 }
 
 /* --- Helper: Robust Normalization --- */
@@ -778,17 +1131,25 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->num_arms = arms;
   bandit->current_arm = 0;
   bandit->current_arm_eff = 0;
+  bandit->dwell_windows = 0;
+  bandit->last_selected_arm = 0;
   bandit->rng_state = 0;
   bandit->verify_enabled =
       bandit_env_int("AFL_ADARARE_VERIFY", 0, 0, 1) ? 1 : 0;
   bandit->rng_seeded_from_owner = 0;
   bandit->rng_log_idx = 0;
   bandit->window_ms = window_ms;
+  bandit->last_cur_window_ms = window_ms;
   
   /* Initial Start Time */
   bandit->win_start_time = bandit_now_ms();
   bandit->win_last_ts = bandit->win_start_time;
   bandit->win_last_arm = bandit->current_arm;
+  bandit->win_clamp_hi = 0;
+  bandit->win_guard_hits = 0;
+  bandit->win_trend_active = 0;
+  bandit->win_reward_zero = 0;
+  bandit->win_has_progress = 0;
   
   bandit->total_rounds = 0.0;     
   bandit->total_selections = 0;   
@@ -798,6 +1159,25 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_raw_reward = 0.0;
   bandit->last_gate_factor = 1.0;
   bandit->last_gate_bonus = 0.0;
+  bandit->last_gate_bonus_final = 0.0;
+  bandit->last_zero_prog_pen = 0.0;
+  bandit->last_win_clamp_hi = 0;
+  bandit->last_win_guard_hits = 0;
+  bandit->last_win_trend_active = 0;
+  bandit->last_win_reward_zero = 0;
+  bandit->last_win_has_progress = 0;
+  bandit->last_stag_bonus_boost = 0;
+  bandit->last_dwell_blocked = 0;
+  bandit->last_guard_penalty = 1.0;
+  bandit->last_guard_streak = 0;
+  bandit->last_guard_arm = 0;
+  bandit->last_zp_streak = 0;
+  bandit->last_zp_applied = 0;
+  bandit->last_zp_factor = 1.0;
+  bandit->last_a6_eta_eff = 0.0;
+  bandit->last_a6_eta_stats = 0.0;
+  bandit->last_a6_eta_model = 0.0;
+  bandit->last_a6_pi_eff = 0.0;
   
   bandit->rarity_norm = BANDIT_RARITY_NORM_PATH_LEN;
   bandit->discount = 0.99; 
@@ -807,12 +1187,12 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_mix_choice = 0;
   bandit->last_arm_used = 0;
   bandit->last_arm_eff_used = 0;
-  bandit->alpha = 0.5;
+  bandit->alpha = 0.6;
   bandit->use_contextual = 1;
   bandit->ridge_lambda =
       bandit_env_double("AFL_ADARARE_RIDGE", BANDIT_LINUCB_RIDGE, 1.0, 1000.0);
-  bandit->gate_multiplier = bandit_env_double("AFL_ADARARE_GATE_MULT",
-                                              BANDIT_GATE_MULTIPLIER, 0.0, 1.0);
+  bandit->gate_multiplier =
+      bandit_env_double("AFL_ADARARE_GATE_MULT", 0.02, 0.0, 1.0);
   bandit->gate_cap =
       bandit_env_double("AFL_ADARARE_GATE_CAP", BANDIT_GATE_CAP, 1.0, 10.0);
   bandit->revisit_time_ms = bandit_env_u64(
@@ -821,22 +1201,40 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_improve_ms = bandit->win_start_time;
   bandit->last_revisit_ms = 0;
   bandit->stagnation_windows = 0;
+  bandit->stag_ema_reward = 0.0;
+  bandit->stag_ema_edges = 0.0;
+  bandit->stag_slope_reward = 0.0;
+  bandit->stag_slope_edges = 0.0;
+  bandit->stag_trend_inited = 0;
+  bandit->stag_trend_active = 0;
   bandit->rarity_decay = bandit_env_double("AFL_ADARARE_SCORE_DECAY",
                                            BANDIT_DEFAULT_RARITY_DECAY, 0.90,
                                            1.0);
   bandit->rarity_ema =
       bandit_env_double("AFL_ADARARE_RARITY_EMA", 1.0, 0.05, 1.0);
   bandit->mix_p = bandit_env_double("AFL_ADARARE_MIX_P", 0.5, 0.0, 1.0);
+  for (u32 k = 0; k < AFL_BANDIT_MAX_ARMS; ++k) {
+    bandit->a6_topk[k] = 0;
+    bandit->a6_topk_prob[k] = 0.0;
+  }
+  bandit->last_a6_choice = 0;
+  bandit->a6_choice_pi = 0.0;
+  bandit->a6_to_a1 = 0;
+  bandit->a6_to_a2 = 0;
+  bandit->a6_q1 = 0.0;
+  bandit->a6_q2 = 0.0;
+  bandit->tie_break_hits_total = 0;
+  bandit->tie_break_hits_win = 0;
   bandit->dict_baseline_prob =
       (u32)bandit_env_u64("AFL_ADARARE_DICT_BASELINE_PROB", 100, 0, 100);
   bandit->dict_enable =
       bandit_env_int("AFL_ADARARE_DICT_ENABLE", 1, 0, 1) ? 1 : 0;
   bandit->reward_alpha =
-      bandit_env_double("AFL_ADARARE_REWARD_ALPHA", 0.6, 0.0, 1.0);
+      bandit_env_double("AFL_ADARARE_REWARD_ALPHA", 0.75, 0.0, 1.0);
   bandit->reward_beta =
-      bandit_env_double("AFL_ADARARE_REWARD_BETA", 0.3, 0.0, 1.0);
+      bandit_env_double("AFL_ADARARE_REWARD_BETA", 0.20, 0.0, 1.0);
   bandit->reward_gamma =
-      bandit_env_double("AFL_ADARARE_REWARD_GAMMA", 0.1, 0.0, 1.0);
+      bandit_env_double("AFL_ADARARE_REWARD_GAMMA", 0.05, 0.0, 1.0);
       
   bandit->reward_c1 =
       bandit_env_double("AFL_ADARARE_REWARD_C1", 50.0, 1e-12, 1e12);
@@ -845,12 +1243,12 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
       
   double wsum = bandit->reward_alpha + bandit->reward_beta + bandit->reward_gamma;
   if (wsum <= 0.0) {
-    bandit->reward_alpha = 0.6;
-    bandit->reward_beta = 0.3;
-    bandit->reward_gamma = 0.1;
+    bandit->reward_alpha = 0.75;
+    bandit->reward_beta = 0.20;
+    bandit->reward_gamma = 0.05;
   }
   bandit->alpha =
-      bandit_env_double("AFL_ADARARE_ALPHA", bandit->alpha, 0.0, 10.0);
+      bandit_env_double("AFL_ADARARE_ALPHA", 0.6, 0.0, 10.0);
   bandit->use_contextual =
       bandit_env_int("AFL_ADARARE_CONTEXTUAL", 1, 0, 1) ? 1 : 0;
       
@@ -874,6 +1272,7 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_thrpt = 0.0;
   bandit->last_thrpt_ref = 0.0;
   bandit->last_thrpt_pen = 0.0;
+  bandit->last_thrpt_pen_eff = 0.0;
   bandit->last_timeout_hz = 0.0;
   bandit->last_slow_hz = 0.0;
   bandit->last_delta_bits = 0.0;
@@ -889,12 +1288,22 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_time_sec = 1.0;
   bandit->last_edges_rate = 0.0;
   bandit->last_rarity_rate = 0.0;
+  bandit->last_edges_per_exec = 0.0;
+  bandit->last_rarity_per_exec = 0.0;
   bandit->last_edges_term = 0.0;
   bandit->last_rarity_term = 0.0;
   
   bandit->linucb_invert_fail_last = 0;
   bandit->linucb_rad_cap_hits_last = 0;
   bandit->linucb_score_cap_hits_last = 0;
+
+#if BANDIT_BUILD_ID_AUDIT
+  if (!bandit_build_id_logged) {
+    const char *build_id = adarare_build_id_effective();
+    fprintf(stderr, "[adarare] build_id=%s\n", build_id);
+    bandit_build_id_logged = 1;
+  }
+#endif
 
   for (u32 i = 0; i < bandit->num_arms; ++i) {
     for (u32 r = 0; r < BANDIT_CTX_DIM; ++r) {
@@ -906,6 +1315,12 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
     bandit->arms[i].last_selected_ms = 0;
     bandit->arms[i].last_thrpt = 0.0;
     bandit->arms[i].last_seen_ms = 0;
+    bandit->arms[i].guard_streak = 0;
+    bandit->arms[i].zp_streak = 0;
+    bandit->arms[i].edges_ema = 0.0;
+    bandit->arms[i].early_edges_ema = 0.0;
+    bandit->arms[i].edges_per_exec_ema = 0.0;
+    bandit->arms[i].rarity_per_exec_ema = 0.0;
   }
   for (u32 k = 0; k < BANDIT_CTX_DIM; ++k) bandit->last_x[k] = 0.0;
   
@@ -923,6 +1338,54 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
     reservoir_reset(&((bandit_reservoir_t *)bandit->edges_rate_res)[i]);
     reservoir_reset(&((bandit_reservoir_t *)bandit->rarity_rate_res)[i]);
   }
+
+  bandit_build_a6_topk(bandit);
+}
+
+static void bandit_apply_arm_policy(afl_state_t *afl, bandit_state_t *bandit) {
+
+  if (!bandit) { return; }
+
+  u32 arm = bandit->current_arm_eff;
+  if (arm >= bandit->num_arms) {
+    arm = bandit_effective_arm(bandit->current_arm, bandit->mix_choice);
+  }
+  if (arm >= bandit->num_arms) { arm = 0; }
+
+  const bandit_arm_cfg_t *cfg = bandit_arm_cfg_for_arm(arm);
+  u32 dict_prob = bandit->dict_baseline_prob;
+  if (bandit->dict_enable) {
+    dict_prob = bandit_dict_prob_for_arm(arm);
+  }
+
+  bandit->last_dict_prob = dict_prob;
+  if (!afl) { return; }
+
+  afl->adarare_dict_prob = dict_prob;
+
+  if (!cfg) {
+    afl->adarare_prefer_favored = 0;
+    afl->adarare_prefer_new = 0;
+    afl->adarare_havoc_mul_pct = 100;
+    return;
+  }
+
+  afl->adarare_prefer_favored = cfg->prefer_favored;
+  afl->adarare_prefer_new = cfg->prefer_new ? 1 : 0;
+
+  double mul = cfg->havoc_stack_mul;
+  if (!isfinite(mul) || mul <= 0.0) mul = 1.0;
+  double pct_d = mul * 100.0;
+  if (!isfinite(pct_d) || pct_d < 10.0) pct_d = 10.0;
+  if (pct_d > 400.0) pct_d = 400.0;
+  afl->adarare_havoc_mul_pct = (u32)(pct_d + 0.5);
+
+  if (cfg->trim_policy == 1) {
+    afl->disable_trim = 1;
+  } else if (cfg->trim_policy == 2) {
+    afl->disable_trim = 0;
+  }
+
 }
 
 void bandit_set_owner(bandit_state_t *bandit, struct afl_state *afl) {
@@ -930,10 +1393,7 @@ void bandit_set_owner(bandit_state_t *bandit, struct afl_state *afl) {
   bandit->owner = afl;
   if (afl) {
     afl->bandit_dict_enable = bandit->dict_enable ? 1 : 0;
-    afl->adarare_dict_prob = bandit_current_dict_prob(bandit);
-    if (!bandit->enabled) {
-      afl->adarare_dict_prob = bandit->dict_baseline_prob;
-    }
+    bandit_apply_arm_policy(afl, bandit);
     if (!bandit->rng_seeded_from_owner) {
       bandit->rng_state =
           ((u64)afl->rand_seed[0] << 32) ^ (u64)afl->rand_seed[1] ^
@@ -986,7 +1446,11 @@ void bandit_on_exec(bandit_state_t *bandit, u64 execs, u64 time_us, u64 timeouts
 
 double bandit_current_multiplier(const bandit_state_t *bandit) {
   if (!bandit || !bandit->enabled) { return 1.0; }
-  return bandit_multiplier_for_arm(bandit->current_arm);
+  u32 arm = bandit->current_arm_eff;
+  if (arm >= bandit->num_arms) {
+    arm = bandit_effective_arm(bandit->current_arm, bandit->mix_choice);
+  }
+  return bandit_multiplier_for_arm(arm);
 }
 
 u8 bandit_maybe_rotate(bandit_state_t *bandit) {
@@ -1009,8 +1473,10 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     bandit->win_last_ts = bandit->win_start_time;
     bandit->win_last_arm = bandit->current_arm;
   }
-  
-  if (entry_now_ms - bandit->win_start_time < bandit->window_ms) { return 0; }
+
+  u64 cur_window_ms = bandit_current_window_ms(bandit);
+  bandit->last_cur_window_ms = cur_window_ms;
+  if (entry_now_ms - bandit->win_start_time < cur_window_ms) { return 0; }
   
   u32 prev_arm_idx = bandit->current_arm;
 
@@ -1041,7 +1507,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     time_sec = (double)dur / 1000.0;
   }
   
-  double win_sec_fallback = (double)bandit->window_ms / 1000.0;
+  double win_sec_fallback = (double)cur_window_ms / 1000.0;
   if (win_sec_fallback < 1e-4) win_sec_fallback = 1e-4;
   double safe_time = (time_sec > 1e-6) ? time_sec : win_sec_fallback;
 
@@ -1113,14 +1579,16 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
 
   double delta_bits = (double)bandit->win_new_bits;
   double delta_rarity = bandit->win_rarity_mass;
+  double exec_denom = (double)(bandit->win_execs ? bandit->win_execs : 1);
+  double edges_per_exec = delta_bits / exec_denom;
+  double rarity_per_exec = delta_rarity / exec_denom;
+  if (!isfinite(edges_per_exec) || edges_per_exec < 0.0) edges_per_exec = 0.0;
+  if (!isfinite(rarity_per_exec) || rarity_per_exec < 0.0) {
+    rarity_per_exec = 0.0;
+  }
 
   double edges_rate = delta_bits / safe_time;
   double rarity_rate = delta_rarity / safe_time;
-
-#if !ADARARE_GATE_IN_REWARD_ONLY
-  edges_rate *= gate_factor;
-  rarity_rate *= gate_factor;
-#endif
 
   u32 r1 = bandit_get_random(bandit);
   u32 r2 = bandit_get_random(bandit);
@@ -1159,18 +1627,64 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
 
   double edges_term = tanh(edges_rate / scale_c1);
   double rarity_term = tanh(rarity_rate / scale_c2);
-  
-  double raw_reward = bandit->reward_alpha * edges_term +
-                      bandit->reward_beta * rarity_term -
-                      bandit->reward_gamma * thrpt_pen;
-
-#if ADARARE_GATE_IN_REWARD_ONLY
-  raw_reward += gate_bonus;
+  const bandit_arm_cfg_t *reward_cfg = bandit_arm_cfg_for_arm(window_arm_eff);
+  double rw_alpha = bandit->reward_alpha;
+  double rw_beta = bandit->reward_beta;
+  double rw_gamma = bandit->reward_gamma;
+  double zp_penalty_mul = 1.0;
+  if (reward_cfg) {
+    rw_alpha = reward_cfg->w_alpha;
+    rw_beta = reward_cfg->w_beta;
+    rw_gamma = reward_cfg->w_gamma;
+    if (isfinite(reward_cfg->zp_penalty_mul) && reward_cfg->zp_penalty_mul > 0.0) {
+      zp_penalty_mul = reward_cfg->zp_penalty_mul;
+    }
+  }
+  double rw_sum = rw_alpha + rw_beta + rw_gamma;
+  if (!isfinite(rw_sum) || rw_sum <= BANDIT_PULLS_EPSILON) {
+    rw_alpha = bandit->reward_alpha;
+    rw_beta = bandit->reward_beta;
+    rw_gamma = bandit->reward_gamma;
+    rw_sum = rw_alpha + rw_beta + rw_gamma;
+  }
+  if (isfinite(rw_sum) && rw_sum > BANDIT_PULLS_EPSILON) {
+    rw_alpha /= rw_sum;
+    rw_beta /= rw_sum;
+    rw_gamma /= rw_sum;
+  }
+  u8 has_progress =
+      (bandit->win_new_cov > 0 || bandit->win_new_bits > 0 ||
+       bandit->win_rarity_mass > BANDIT_PROGRESS_RARITY_EPS)
+          ? 1
+          : 0;
+  double thrpt_pen_eff = thrpt_pen;
+  if (has_progress) {
+    thrpt_pen_eff *= ADARARE_THRPT_PEN_IF_PROGRESS;
+  }
+  double gate_bonus_final = gate_bonus;
+#if BANDIT_PROGRESS_GATE_ENABLE
+  if (!has_progress) gate_bonus_final = 0.0;
 #endif
+  
+  double raw_reward = rw_alpha * edges_term +
+                      rw_beta * rarity_term -
+                      rw_gamma * thrpt_pen_eff;
+  raw_reward += gate_bonus_final;
+  double zero_prog_pen = 0.0;
+  if (!has_progress) {
+    zero_prog_pen = ADARARE_ZERO_PROGRESS_PENALTY * zp_penalty_mul;
+    raw_reward -= zero_prog_pen;
+  }
+
+  double raw_reward_pre_clamp = raw_reward;
   
   if (raw_reward < 0.0) raw_reward = 0.0;
   if (raw_reward > 1.0) raw_reward = 1.0;
   if (!isfinite(raw_reward)) raw_reward = 0.0;
+
+  bandit->win_clamp_hi = (raw_reward_pre_clamp > 1.0) ? 1U : 0U;
+  bandit->win_reward_zero = (raw_reward <= 0.0) ? 1U : 0U;
+  bandit->win_has_progress = has_progress;
 
   double timeout_hz = (double)bandit->win_timeouts / safe_time;
   double slow_hz = (double)bandit->win_slow_execs / safe_time;
@@ -1178,6 +1692,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_thrpt = thrpt;
   bandit->last_thrpt_ref = bandit->thrpt_ref_inited ? bandit->thrpt_ref_ema : thrpt;
   bandit->last_thrpt_pen = thrpt_pen;
+  bandit->last_thrpt_pen_eff = thrpt_pen_eff;
   bandit->last_timeout_hz = timeout_hz;
   bandit->last_slow_hz = slow_hz;
   bandit->last_delta_bits = delta_bits;
@@ -1185,12 +1700,31 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_delta_rarity = delta_rarity;
   bandit->last_gate_factor = gate_factor;
   bandit->last_gate_bonus = gate_bonus;
+  bandit->last_gate_bonus_final = gate_bonus_final;
+  bandit->last_zero_prog_pen = zero_prog_pen;
   
   bandit->last_time_sec = safe_time;
   bandit->last_edges_rate = edges_rate;
   bandit->last_rarity_rate = rarity_rate;
+  bandit->last_edges_per_exec = edges_per_exec;
+  bandit->last_rarity_per_exec = rarity_per_exec;
   bandit->last_edges_term = edges_term;
   bandit->last_rarity_term = rarity_term;
+
+  u32 progress_arm = window_arm_eff;
+  if (progress_arm >= bandit->num_arms) {
+    progress_arm = bandit->current_arm;
+    if (progress_arm >= bandit->num_arms) progress_arm = 0;
+  }
+  if (progress_arm < bandit->num_arms) {
+    if (!has_progress) {
+      if (bandit->arms[progress_arm].zp_streak < UINT_MAX) {
+        bandit->arms[progress_arm].zp_streak++;
+      }
+    } else if (bandit->arms[progress_arm].zp_streak > 0) {
+      bandit->arms[progress_arm].zp_streak--;
+    }
+  }
 
   if (bandit->current_arm < bandit->num_arms &&
       bandit->current_arm < AFL_BANDIT_MAX_ARMS) {
@@ -1251,6 +1785,73 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     arm_weights[fallback_arm] = 1.0;
   }
 
+  u32 ema_arm = window_arm_eff;
+  double best_w = -1.0;
+  for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
+    if (arm_weights[i] > best_w) {
+      best_w = arm_weights[i];
+      ema_arm = i;
+    }
+  }
+  if (ema_arm >= bandit->num_arms) {
+    ema_arm = (window_arm_eff < bandit->num_arms) ? window_arm_eff : 0;
+  }
+  if (ema_arm < bandit->num_arms) {
+    double observed_edges = edges_rate;
+    double observed_edges_per_exec = edges_per_exec;
+    double observed_rarity_per_exec = rarity_per_exec;
+    if (!isfinite(observed_edges) || observed_edges < 0.0) observed_edges = 0.0;
+    if (!isfinite(observed_edges_per_exec) || observed_edges_per_exec < 0.0) {
+      observed_edges_per_exec = 0.0;
+    }
+    if (!isfinite(observed_rarity_per_exec) || observed_rarity_per_exec < 0.0) {
+      observed_rarity_per_exec = 0.0;
+    }
+    double prev_ema = bandit->arms[ema_arm].edges_ema;
+    if (!isfinite(prev_ema) || prev_ema < 0.0) prev_ema = 0.0;
+    if (prev_ema <= 0.0) {
+      bandit->arms[ema_arm].edges_ema = observed_edges;
+    } else {
+      bandit->arms[ema_arm].edges_ema =
+          (1.0 - ADARARE_EDGES_EMA_ALPHA) * prev_ema +
+          ADARARE_EDGES_EMA_ALPHA * observed_edges;
+    }
+
+    if (bandit->arms[ema_arm].pulls < ADARARE_EARLY_EDGES_PULLS_CUTOFF) {
+      double prev_early = bandit->arms[ema_arm].early_edges_ema;
+      if (!isfinite(prev_early) || prev_early < 0.0) prev_early = 0.0;
+      if (prev_early <= 0.0) {
+        bandit->arms[ema_arm].early_edges_ema = observed_edges;
+      } else {
+        bandit->arms[ema_arm].early_edges_ema =
+            (1.0 - ADARARE_EDGES_EMA_ALPHA) * prev_early +
+            ADARARE_EDGES_EMA_ALPHA * observed_edges;
+      }
+    }
+
+    double prev_edges_exec = bandit->arms[ema_arm].edges_per_exec_ema;
+    if (!isfinite(prev_edges_exec) || prev_edges_exec < 0.0) prev_edges_exec = 0.0;
+    if (prev_edges_exec <= 0.0) {
+      bandit->arms[ema_arm].edges_per_exec_ema = observed_edges_per_exec;
+    } else {
+      bandit->arms[ema_arm].edges_per_exec_ema =
+          (1.0 - ADARARE_EDGES_EMA_ALPHA) * prev_edges_exec +
+          ADARARE_EDGES_EMA_ALPHA * observed_edges_per_exec;
+    }
+
+    double prev_rarity_exec = bandit->arms[ema_arm].rarity_per_exec_ema;
+    if (!isfinite(prev_rarity_exec) || prev_rarity_exec < 0.0) {
+      prev_rarity_exec = 0.0;
+    }
+    if (prev_rarity_exec <= 0.0) {
+      bandit->arms[ema_arm].rarity_per_exec_ema = observed_rarity_per_exec;
+    } else {
+      bandit->arms[ema_arm].rarity_per_exec_ema =
+          (1.0 - ADARARE_EDGES_EMA_ALPHA) * prev_rarity_exec +
+          ADARARE_EDGES_EMA_ALPHA * observed_rarity_per_exec;
+    }
+  }
+
   u64 selection_round = bandit->total_selections + 1;
   double pulls_credit = 0.0;
   for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
@@ -1288,6 +1889,11 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_win_time_us     = bandit->win_time_us;
   bandit->last_win_new_cov     = bandit->win_new_cov;
   bandit->last_win_new_bits    = bandit->win_new_bits;
+  bandit->last_win_clamp_hi    = bandit->win_clamp_hi;
+  bandit->last_win_guard_hits  = bandit->win_guard_hits;
+  bandit->last_win_trend_active = bandit->win_trend_active;
+  bandit->last_win_reward_zero = bandit->win_reward_zero;
+  bandit->last_win_has_progress = bandit->win_has_progress;
   bandit->last_win_novelty     = bandit->win_novelty;
   bandit->last_win_rarity_mass = bandit->win_rarity_mass;
   bandit->last_win_timeouts    = bandit->win_timeouts;
@@ -1298,11 +1904,59 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_win_gate_execavg = bandit->win_gate_exec_samples 
       ? bandit->win_gate_exec_sum / bandit->win_gate_exec_samples : 0.0;
 
+  double trend_edges_signal = log1p(edges_rate);
+  if (!isfinite(trend_edges_signal) || trend_edges_signal < 0.0) {
+    trend_edges_signal = 0.0;
+  }
+  if (!bandit->stag_trend_inited) {
+    bandit->stag_ema_reward = final_reward;
+    bandit->stag_ema_edges = trend_edges_signal;
+    bandit->stag_slope_reward = 0.0;
+    bandit->stag_slope_edges = 0.0;
+    bandit->stag_trend_inited = 1;
+  } else {
+    double prev_ema_reward = bandit->stag_ema_reward;
+    double prev_ema_edges = bandit->stag_ema_edges;
+    bandit->stag_ema_reward =
+        (1.0 - BANDIT_STAG_TREND_ALPHA) * bandit->stag_ema_reward +
+        BANDIT_STAG_TREND_ALPHA * final_reward;
+    bandit->stag_ema_edges =
+        (1.0 - BANDIT_STAG_TREND_ALPHA) * bandit->stag_ema_edges +
+        BANDIT_STAG_TREND_ALPHA * trend_edges_signal;
+
+    double inst_reward_slope = bandit->stag_ema_reward - prev_ema_reward;
+    double inst_edges_slope = bandit->stag_ema_edges - prev_ema_edges;
+    bandit->stag_slope_reward =
+        (1.0 - BANDIT_STAG_SLOPE_ALPHA) * bandit->stag_slope_reward +
+        BANDIT_STAG_SLOPE_ALPHA * inst_reward_slope;
+    bandit->stag_slope_edges =
+        (1.0 - BANDIT_STAG_SLOPE_ALPHA) * bandit->stag_slope_edges +
+        BANDIT_STAG_SLOPE_ALPHA * inst_edges_slope;
+  }
+
+  u8 trend_ready =
+      (bandit->stag_trend_inited &&
+       bandit->total_selections >= BANDIT_STAG_TREND_MIN_WINDOWS)
+          ? 1
+          : 0;
+  u8 trend_stagnating =
+      (trend_ready &&
+       fabs(bandit->stag_slope_reward) < BANDIT_STAG_REWARD_SLOPE_EPS &&
+       fabs(bandit->stag_slope_edges) < BANDIT_STAG_EDGES_SLOPE_EPS)
+          ? 1
+          : 0;
+  bandit->stag_trend_active = trend_stagnating;
+  bandit->win_trend_active = trend_stagnating;
+
   if (bandit->win_new_cov > 0 || bandit->win_new_bits > 0) {
     bandit->stagnation_windows = 0;
     bandit->last_improve_ms = entry_now_ms;
-  } else if (bandit->stagnation_windows < UINT_MAX) {
+    bandit->stag_trend_active = 0;
+    bandit->win_trend_active = 0;
+  } else if (trend_stagnating && bandit->stagnation_windows < UINT_MAX) {
     bandit->stagnation_windows++;
+  } else if (bandit->stagnation_windows > 0) {
+    bandit->stagnation_windows--;
   }
       
   bandit->linucb_invert_fail_last = bandit->linucb_invert_fail_win;
@@ -1328,19 +1982,12 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
       reservoir_reset((bandit_reservoir_t*)bandit->score_res);
   }
 
-  if (bandit->owner) {
-    bandit->last_dict_attempts = bandit->owner->adarare_dict_attempts_win;
-    bandit->last_dict_taken = bandit->owner->adarare_dict_taken_win;
-    bandit->owner->adarare_dict_attempts_win = 0;
-    bandit->owner->adarare_dict_taken_win = 0;
-    bandit_log_window(bandit->owner);
-  }
-
   /* ============================================================ */
   /* 5. Selection (Warmup + Stagnation-aware UCB/Revisit)         */
   /* ============================================================ */
 
   u32 next_arm = bandit->current_arm;
+  bandit_build_a6_topk(bandit);
   
   double x[BANDIT_CTX_DIM];
   double vc = (double)bandit->last_win_new_bits / safe_time;
@@ -1378,18 +2025,116 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     }
   }
 
+  bandit->last_a6_eta_eff = 0.0;
+  bandit->last_a6_eta_stats = 0.0;
+  bandit->last_a6_eta_model = 0.0;
+  bandit->last_a6_pi_eff = 0.0;
   if (bandit->current_arm == BANDIT_ARM_A6 && window_arm_eff < bandit->num_arms &&
       window_arm_eff != bandit->current_arm) {
-    bandit_arm_state_t *eff_arm = &bandit->arms[window_arm_eff];
-    eff_arm->pulls += BANDIT_A6_OFFPOLICY_ETA;
-    eff_arm->total_reward += final_reward * BANDIT_A6_OFFPOLICY_ETA;
-    if (BANDIT_A6_OFFPOLICY_ETA > 0.0) {
-      eff_arm->selections += 1;
-      eff_arm->last_selected_round = bandit->total_selections;
+
+    if (window_arm_eff == BANDIT_ARM_A1 || window_arm_eff == BANDIT_ARM_A2) {
+      if (window_arm_eff == BANDIT_ARM_A1) {
+        bandit->a6_to_a1++;
+        double old_q = bandit->a6_q1;
+        if (!isfinite(old_q) || old_q < 0.0) old_q = 0.0;
+        bandit->a6_q1 = (old_q <= 0.0)
+                            ? final_reward
+                            : (1.0 - ADARARE_A6_MIX_EMA_ALPHA) * old_q +
+                                  ADARARE_A6_MIX_EMA_ALPHA * final_reward;
+      } else {
+        bandit->a6_to_a2++;
+        double old_q = bandit->a6_q2;
+        if (!isfinite(old_q) || old_q < 0.0) old_q = 0.0;
+        bandit->a6_q2 = (old_q <= 0.0)
+                            ? final_reward
+                            : (1.0 - ADARARE_A6_MIX_EMA_ALPHA) * old_q +
+                                  ADARARE_A6_MIX_EMA_ALPHA * final_reward;
+      }
     }
+
+#if ADARARE_ENABLE_ADAPTIVE_A6
+    u64 a6_total = bandit->a6_to_a1 + bandit->a6_to_a2;
+    if (a6_total > 0 && (a6_total % ADARARE_MIX_UPDATE_INTERVAL) == 0) {
+      double q1 = 0.0;
+      double q2 = 0.0;
+      if (BANDIT_ARM_A1 < bandit->num_arms) {
+        q1 = bandit_arm_mean_reward(&bandit->arms[BANDIT_ARM_A1]);
+      }
+      if (BANDIT_ARM_A2 < bandit->num_arms) {
+        q2 = bandit_arm_mean_reward(&bandit->arms[BANDIT_ARM_A2]);
+      }
+      if (!isfinite(q1) || q1 < 0.0) q1 = 0.0;
+      if (!isfinite(q2) || q2 < 0.0) q2 = 0.0;
+      double qsum = q1 + q2;
+      if (qsum >= ADARARE_A6_MIX_UPDATE_MIN_QSUM) {
+        /* mix_p is P(A6 delegates to A2). */
+        double target = q2 / (qsum + BANDIT_PULLS_EPSILON);
+        double new_p =
+            (1.0 - ADARARE_A6_MIX_EMA) * bandit->mix_p +
+            ADARARE_A6_MIX_EMA * target;
+        if (!isfinite(new_p)) new_p = bandit->mix_p;
+        bandit->mix_p = new_p;
+      } else {
+        bandit->mix_p =
+            (1.0 - ADARARE_A6_MIX_RETURN_RATE) * bandit->mix_p +
+            ADARARE_A6_MIX_RETURN_RATE * 0.5;
+      }
+      if (bandit->mix_p < ADARARE_MIX_P_MIN) bandit->mix_p = ADARARE_MIX_P_MIN;
+      if (bandit->mix_p > ADARARE_MIX_P_MAX) bandit->mix_p = ADARARE_MIX_P_MAX;
+    }
+#endif
+
+    double pi = bandit->a6_choice_pi;
+    if (!isfinite(pi) || pi <= 0.0) {
+      pi = bandit_a6_choice_prob(bandit, window_arm_eff);
+    }
+    if (!isfinite(pi) || pi <= 0.0) {
+      pi = 1.0 / (double)ADARARE_A6_TOPK;
+    }
+    if (!isfinite(pi) || pi < ADARARE_IPS_PI_EPS) pi = ADARARE_IPS_PI_EPS;
+    if (pi > 1.0) pi = 1.0;
+    bandit->last_a6_pi_eff = pi;
+
+    double eta_eff = ADARARE_A6_BASE_ETA;
+#if ADARARE_ENABLE_IPS
+    double ips = 1.0 / pi;
+    if (!isfinite(ips) || ips < 1.0) ips = 1.0;
+    if (ips > ADARARE_IPS_CLIP) ips = ADARARE_IPS_CLIP;
+    eta_eff = ips;
+#endif
+    if (!isfinite(eta_eff) || eta_eff < 1.0) eta_eff = 1.0;
+    if (eta_eff > ADARARE_IPS_CLIP) eta_eff = ADARARE_IPS_CLIP;
+    double eta_stats = ADARARE_A6_BASE_ETA;
+#if ADARARE_ENABLE_IPS_STATS
+    eta_stats = eta_eff;
+#endif
+    if (!isfinite(eta_stats) || eta_stats < 1.0) eta_stats = 1.0;
+    if (eta_stats > ADARARE_IPS_CLIP) eta_stats = ADARARE_IPS_CLIP;
+
+    double eta_model = 1.0;
+#if ADARARE_ENABLE_IPS_MODEL
+    eta_model = eta_stats;
+    if (eta_model > ADARARE_IPS_MODEL_CLIP) {
+      eta_model = ADARARE_IPS_MODEL_CLIP;
+    }
+#endif
+    if (!isfinite(eta_model) || eta_model <= 0.0) eta_model = 1.0;
+    if (eta_model > ADARARE_IPS_MODEL_CLIP) eta_model = ADARARE_IPS_MODEL_CLIP;
+
+    bandit->last_a6_eta_eff = eta_stats;
+    bandit->last_a6_eta_stats = eta_stats;
+    bandit->last_a6_eta_model = eta_model;
+
+    bandit_arm_state_t *eff_arm = &bandit->arms[window_arm_eff];
+    eff_arm->pulls += eta_stats;
+    eff_arm->total_reward += final_reward * eta_stats;
+    if (eff_arm->total_reward > eff_arm->pulls) {
+      eff_arm->total_reward = eff_arm->pulls;
+    }
+    eff_arm->selections += 1;
+    eff_arm->last_selected_round = bandit->total_selections;
     if (bandit->use_contextual) {
-      bandit_update_arm_model(bandit, eff_arm, x, final_reward,
-                              BANDIT_A6_OFFPOLICY_ETA);
+      bandit_update_arm_model(bandit, eff_arm, x, final_reward, eta_model);
     }
   }
 
@@ -1398,17 +2143,28 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   double score_total_dbg[AFL_BANDIT_MAX_ARMS];
   double score_guard_ratio_dbg[AFL_BANDIT_MAX_ARMS];
   double score_guard_factor_dbg[AFL_BANDIT_MAX_ARMS];
+  u32 score_guard_streak_dbg[AFL_BANDIT_MAX_ARMS];
+  double score_zp_factor_dbg[AFL_BANDIT_MAX_ARMS];
+  u8 score_zp_applied_dbg[AFL_BANDIT_MAX_ARMS];
+  u32 guard_hits = 0;
+  u32 tie_break_hits = 0;
+  u8 dwell_blocked = 0;
   for (u32 i = 0; i < AFL_BANDIT_MAX_ARMS; ++i) {
     score_pred_dbg[i] = NAN;
     score_bonus_dbg[i] = NAN;
     score_total_dbg[i] = NAN;
     score_guard_ratio_dbg[i] = 1.0;
     score_guard_factor_dbg[i] = 1.0;
+    score_guard_streak_dbg[i] = 0;
+    score_zp_factor_dbg[i] = 1.0;
+    score_zp_applied_dbg[i] = 0;
   }
 
   bandit->in_warmup = bandit_in_pulls_warmup(bandit);
   u8 stagnating = (bandit->stagnation_windows >= BANDIT_STAG_WINDOWS) ? 1 : 0;
   u8 force_revisit = 0;
+  u8 stag_bonus_boost = 0;
+  bandit->last_stag_bonus_boost = 0;
 
   if (bandit->in_warmup) {
     next_arm = bandit_argmin_pulls(bandit);
@@ -1420,9 +2176,21 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     force_revisit = 1;
   } else {
     double best_score = -DBL_MAX;
+    double best_cov_early = -DBL_MAX;
+    double best_cov = -DBL_MAX;
+    double best_cov_exec = -DBL_MAX;
     double log_t =
         log((double)(bandit->total_selections > 1 ? bandit->total_selections : 1));
-    double stagnation_bonus_mul = stagnating ? BANDIT_STAG_BOOST : 1.0;
+    double stagnation_bonus_mul = 1.0;
+    if (stagnating) {
+      double over =
+          (double)(bandit->stagnation_windows - BANDIT_STAG_WINDOWS + 1U);
+      double ramp = over / (double)BANDIT_STAG_WINDOWS;
+      if (ramp > 1.0) ramp = 1.0;
+      stagnation_bonus_mul = 1.0 + (BANDIT_STAG_BOOST - 1.0) * ramp;
+    }
+    stag_bonus_boost = (stagnation_bonus_mul > 1.0 + BANDIT_PULLS_EPSILON) ? 1 : 0;
+    bandit->last_stag_bonus_boost = stag_bonus_boost;
 
     for (u32 i = 0; i < bandit->num_arms; ++i) {
       double score = 0.0;
@@ -1430,6 +2198,9 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
       double bonus = 0.0;
       double guard_ratio = 1.0;
       double guard_factor = 1.0;
+      u32 guard_streak = bandit->arms[i].guard_streak;
+      double zp_factor = 1.0;
+      u8 zp_applied = 0;
 
       if (bandit->arms[i].selections == 0) {
         pred = 0.0;
@@ -1496,20 +2267,51 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
       if (bandit->thrpt_ref_inited && bandit->thrpt_ref_ema > 1e-9 &&
           bandit->arms[i].last_seen_ms > 0) {
         double arm_thrpt = bandit->arms[i].last_thrpt;
-        double guard_penalty = BANDIT_THRPT_GUARD_PENALTY;
         if (!isfinite(arm_thrpt) || arm_thrpt < 0.0) arm_thrpt = 0.0;
-        if (!isfinite(guard_penalty)) guard_penalty = 1.0;
-        if (guard_penalty < 0.0) guard_penalty = 0.0;
-        if (guard_penalty > 1.0) guard_penalty = 1.0;
 
         guard_ratio = arm_thrpt / bandit->thrpt_ref_ema;
         if (!isfinite(guard_ratio) || guard_ratio < 0.0) guard_ratio = 0.0;
         if (guard_ratio < BANDIT_THRPT_GUARD_RATIO) {
-          score *= guard_penalty;
-          guard_factor = guard_penalty;
+          double norm =
+              guard_ratio / (BANDIT_THRPT_GUARD_RATIO + BANDIT_PULLS_EPSILON);
+          if (norm < 0.0) norm = 0.0;
+          if (norm > 1.0) norm = 1.0;
+          double deficit = 1.0 - norm;
+          double soft_penalty = 1.0 - BANDIT_THRPT_GUARD_SOFT_K * deficit;
+          if (soft_penalty > 1.0) soft_penalty = 1.0;
+          if (soft_penalty < BANDIT_THRPT_GUARD_PENALTY_MIN) {
+            soft_penalty = BANDIT_THRPT_GUARD_PENALTY_MIN;
+          }
+          if (guard_streak < UINT_MAX) guard_streak++;
+          if (guard_streak > BANDIT_THRPT_GUARD_STREAK_START) {
+            double extra =
+                (double)(guard_streak - BANDIT_THRPT_GUARD_STREAK_START) *
+                BANDIT_THRPT_GUARD_STREAK_STEP;
+            soft_penalty -= extra;
+            if (soft_penalty < BANDIT_THRPT_GUARD_PENALTY_MIN) {
+              soft_penalty = BANDIT_THRPT_GUARD_PENALTY_MIN;
+            }
+          }
+          score *= soft_penalty;
+          guard_factor = soft_penalty;
+          guard_hits++;
+        } else if (guard_streak > 0) {
+          guard_streak--;
         }
       }
 #endif
+
+      if (bandit->arms[i].zp_streak >= ADARARE_ZP_STREAK_START) {
+        double drop = (double)(bandit->arms[i].zp_streak - ADARARE_ZP_STREAK_START) *
+                      ADARARE_ZP_STEP;
+        zp_factor = 1.0 - drop;
+        if (zp_factor < ADARARE_ZP_FACTOR_MIN) zp_factor = ADARARE_ZP_FACTOR_MIN;
+        if (zp_factor > 1.0) zp_factor = 1.0;
+        score *= zp_factor;
+        zp_applied = (zp_factor < 1.0) ? 1 : 0;
+      }
+
+      bandit->arms[i].guard_streak = guard_streak;
 
       if (!isfinite(score)) score = 0.0;
 
@@ -1519,14 +2321,56 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
         score_total_dbg[i] = score;
         score_guard_ratio_dbg[i] = guard_ratio;
         score_guard_factor_dbg[i] = guard_factor;
+        score_guard_streak_dbg[i] = guard_streak;
+        score_zp_factor_dbg[i] = zp_factor;
+        score_zp_applied_dbg[i] = zp_applied;
       }
 
-      if (score > best_score) {
+      double cov_metric = bandit->arms[i].edges_ema;
+      if (!isfinite(cov_metric) || cov_metric < 0.0) cov_metric = 0.0;
+      double cov_metric_early = bandit->arms[i].early_edges_ema;
+      if (!isfinite(cov_metric_early) || cov_metric_early < 0.0) {
+        cov_metric_early = 0.0;
+      }
+      double cov_metric_exec = bandit->arms[i].edges_per_exec_ema;
+      if (!isfinite(cov_metric_exec) || cov_metric_exec < 0.0) {
+        cov_metric_exec = 0.0;
+      }
+
+      double tie_eps = ADARARE_TIE_EPS_REL * fmax(1.0, best_score);
+      if (score > best_score + tie_eps) {
         best_score = score;
+        best_cov_early = cov_metric_early;
+        best_cov = cov_metric;
+        best_cov_exec = cov_metric_exec;
         next_arm = i;
+      } else if (ADARARE_ENABLE_TIE_BREAK &&
+                 fabs(score - best_score) <= tie_eps &&
+                 (cov_metric_early >
+                      best_cov_early + BANDIT_PULLS_EPSILON ||
+                  (fabs(cov_metric_early - best_cov_early) <=
+                       BANDIT_PULLS_EPSILON &&
+                   (cov_metric > best_cov + BANDIT_PULLS_EPSILON ||
+                    (fabs(cov_metric - best_cov) <= BANDIT_PULLS_EPSILON &&
+                     cov_metric_exec >
+                         best_cov_exec + BANDIT_PULLS_EPSILON))))) {
+        best_cov_early = cov_metric_early;
+        best_cov = cov_metric;
+        best_cov_exec = cov_metric_exec;
+        next_arm = i;
+        tie_break_hits++;
+        bandit->tie_break_hits_total++;
       }
     }
   }
+
+  if (!bandit->in_warmup && !force_revisit && !bandit->stag_trend_active &&
+      next_arm != prev_arm_idx &&
+      bandit->dwell_windows < ADARARE_MIN_DWELL_WINDOWS) {
+    next_arm = prev_arm_idx;
+    dwell_blocked = 1;
+  }
+  bandit->last_dwell_blocked = dwell_blocked;
 
   if (next_arm < AFL_BANDIT_MAX_ARMS && !isfinite(score_total_dbg[next_arm])) {
     score_pred_dbg[next_arm] = bandit_arm_mean_reward(&bandit->arms[next_arm]);
@@ -1538,48 +2382,126 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
                             isfinite(score_total_dbg[next_arm]))
                                ? score_total_dbg[next_arm]
                                : 0.0;
+  bandit->tie_break_hits_win = tie_break_hits;
+  bandit->win_guard_hits = guard_hits;
+  bandit->last_win_guard_hits = guard_hits;
+  bandit->last_win_clamp_hi = bandit->win_clamp_hi;
+  bandit->last_win_trend_active = bandit->win_trend_active;
+  bandit->last_win_reward_zero = bandit->win_reward_zero;
+  bandit->last_guard_arm = next_arm;
+  bandit->last_guard_penalty =
+      (next_arm < AFL_BANDIT_MAX_ARMS &&
+       isfinite(score_guard_factor_dbg[next_arm]))
+          ? score_guard_factor_dbg[next_arm]
+          : 1.0;
+  bandit->last_guard_streak =
+      (next_arm < AFL_BANDIT_MAX_ARMS) ? score_guard_streak_dbg[next_arm] : 0;
+  if (!bandit->last_guard_streak && next_arm < bandit->num_arms) {
+    bandit->last_guard_streak = bandit->arms[next_arm].guard_streak;
+  }
+  bandit->last_zp_streak =
+      (next_arm < bandit->num_arms) ? bandit->arms[next_arm].zp_streak : 0;
+  bandit->last_zp_factor =
+      (next_arm < AFL_BANDIT_MAX_ARMS &&
+       isfinite(score_zp_factor_dbg[next_arm]))
+          ? score_zp_factor_dbg[next_arm]
+          : 1.0;
+  bandit->last_zp_applied =
+      (next_arm < AFL_BANDIT_MAX_ARMS) ? score_zp_applied_dbg[next_arm] : 0;
+
+  u8 next_mix_choice = 0;
+  u32 next_arm_eff_candidate = next_arm;
+  double next_a6_pi = 0.0;
+  if (next_arm == BANDIT_ARM_A6) {
+    u32 chosen = bandit->a6_topk[0];
+    double chosen_prob = bandit->a6_topk_prob[0];
+    double pick = (double)bandit_get_random(bandit) / 4294967296.0;
+    if (!isfinite(pick) || pick < 0.0) pick = 0.0;
+    if (pick > 1.0) pick = 1.0;
+    double acc = 0.0;
+    for (u32 k = 0; k < ADARARE_A6_TOPK && k < AFL_BANDIT_MAX_ARMS; ++k) {
+      double p = bandit->a6_topk_prob[k];
+      if (!isfinite(p) || p <= 0.0) continue;
+      acc += p;
+      if (pick <= acc) {
+        chosen = bandit->a6_topk[k];
+        chosen_prob = p;
+        break;
+      }
+    }
+
+    if (chosen >= bandit->num_arms || chosen == BANDIT_ARM_A6) {
+      chosen = BANDIT_ARM_A1;
+      if (chosen >= bandit->num_arms) chosen = 0;
+      chosen_prob = bandit_a6_choice_prob(bandit, chosen);
+    }
+
+    if (!isfinite(chosen_prob) || chosen_prob <= 0.0) {
+      chosen_prob = 1.0 / (double)ADARARE_A6_TOPK;
+    }
+    if (chosen_prob > 1.0) chosen_prob = 1.0;
+
+    next_mix_choice = (u8)chosen;
+    next_arm_eff_candidate = chosen;
+    next_a6_pi = chosen_prob;
+  }
+
+  bandit->last_a6_choice = (next_arm == BANDIT_ARM_A6) ? next_arm_eff_candidate : next_arm;
+  bandit->a6_choice_pi = next_a6_pi;
 
   bandit_dbg_log_window(
-      bandit, entry_now_ms, win_total_ms, prev_arm_idx, next_arm, arm_weights,
+      bandit, entry_now_ms, cur_window_ms, win_total_ms, prev_arm_idx, next_arm,
+      arm_weights,
       score_pred_dbg, score_bonus_dbg, score_total_dbg, score_guard_ratio_dbg,
-      score_guard_factor_dbg, edges_rate, rarity_rate, p90_edges, p90_rarity,
-      scale_c1, scale_c2, res_arm, bandit->reward_gamma * thrpt_pen,
-      gate_bonus, raw_reward, final_reward, force_revisit);
+      score_guard_factor_dbg, score_guard_streak_dbg, score_zp_factor_dbg,
+      score_zp_applied_dbg, tie_break_hits, edges_rate,
+      rarity_rate, edges_per_exec, rarity_per_exec,
+      p90_edges, p90_rarity,
+      scale_c1, scale_c2, res_arm, rw_gamma * thrpt_pen_eff,
+      gate_factor, gate_bonus, gate_bonus_final, zero_prog_pen, has_progress,
+      stag_bonus_boost, dwell_blocked, raw_reward,
+      final_reward, force_revisit);
+
+  if (bandit->owner) {
+    bandit->last_dict_attempts = bandit->owner->adarare_dict_attempts_win;
+    bandit->last_dict_taken = bandit->owner->adarare_dict_taken_win;
+    bandit->owner->adarare_dict_attempts_win = 0;
+    bandit->owner->adarare_dict_taken_win = 0;
+    bandit_log_window(bandit->owner);
+  }
 
   /* Apply Selection */
   bandit->current_arm = next_arm;
-  bandit->mix_choice = 0;
-  
-  if (bandit->current_arm == BANDIT_ARM_A6) {
-    u32 r = bandit_get_random(bandit);
-    double p = bandit->mix_p;
-    if (p < 0.0) p = 0.0;
-    if (p > 1.0) p = 1.0;
-    const double N = 4294967296.0; 
-    u64 threshold = (u64)(p * N); 
-    bandit->mix_choice = ((u64)r < threshold) ? 0 : 1;
+  if (bandit->current_arm == prev_arm_idx) {
+    if (bandit->dwell_windows < UINT_MAX) bandit->dwell_windows++;
+  } else {
+    bandit->dwell_windows = 0;
+    bandit->last_selected_arm = bandit->current_arm;
+  }
+  bandit->mix_choice = next_mix_choice;
+  bandit->current_arm_eff = next_arm_eff_candidate;
+  if (bandit->current_arm != BANDIT_ARM_A6) {
+    bandit->mix_choice = (u8)bandit->current_arm;
+    bandit->current_arm_eff = bandit->current_arm;
+    bandit->a6_choice_pi = 0.0;
   }
 
-  bandit->current_arm_eff = bandit_effective_arm(bandit->current_arm, bandit->mix_choice);
+  bandit->current_arm_eff =
+      bandit_effective_arm(bandit->current_arm, bandit->mix_choice);
   if (bandit->current_arm_eff >= bandit->num_arms) {
     bandit->current_arm_eff = BANDIT_ARM_A1;
   }
 
-  /* Update dict prob for NEXT window (frozen). */
-  u32 next_arm_eff = bandit->current_arm_eff;
-  
-  u32 next_dict_prob = bandit->dict_enable ? bandit_dict_prob_for_arm(next_arm_eff)
-                                           : bandit->dict_baseline_prob;
-  
-  bandit->last_dict_prob = next_dict_prob;
-                                               
-  if (bandit->owner) { 
-      bandit->owner->adarare_dict_prob = next_dict_prob;
-  }
+  /* Apply arm policy for NEXT window (dict, favored bias, energy multipliers). */
+  bandit_apply_arm_policy(bandit->owner, bandit);
 
   /* Finalize Window Reset */
   bandit->win_new_cov = 0;
   bandit->win_new_bits = 0;
+  bandit->win_clamp_hi = 0;
+  bandit->win_guard_hits = 0;
+  bandit->win_trend_active = 0;
+  bandit->win_reward_zero = 0;
   bandit->win_novelty = 0.0;
   bandit->win_rarity_mass = 0.0;
   bandit->win_rarity_samples = 0;
@@ -1592,6 +2514,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->win_gate_samples = 0;
   bandit->win_gate_exec_sum = 0.0;
   bandit->win_gate_exec_samples = 0;
+  bandit->tie_break_hits_win = 0;
   memset(bandit->win_arm_ms, 0, sizeof(bandit->win_arm_ms));
 
   u64 end_now_us = get_cur_time_us();
@@ -1690,6 +2613,8 @@ const char *bandit_gate_label(bandit_gate_t gate) {
 }
 
 const char *bandit_arm_label(u32 arm) {
+  const bandit_arm_cfg_t *cfg = bandit_arm_cfg_for_arm(arm);
+  if (cfg && cfg->name && cfg->name[0]) { return cfg->name; }
   switch (arm) {
     case BANDIT_ARM_A1: return "A1";
     case BANDIT_ARM_A2: return "A2";
@@ -1711,32 +2636,29 @@ double bandit_energy_boost(const bandit_state_t *bandit, double z_in) {
     arm = bandit_effective_arm(bandit->current_arm, bandit->mix_choice);
   }
 
+  const bandit_arm_cfg_t *cfg = bandit_arm_cfg_for_arm(arm);
+  bandit_energy_mode_t mode =
+      cfg ? cfg->energy_boost_mode : BANDIT_ENERGY_FLAT;
+
   double g = 0.0, cap = 1.0;
-  switch (arm) {
-    case BANDIT_ARM_A1:
+  switch (mode) {
+    case BANDIT_ENERGY_LOG:
       g = 2.0 * log1p(2.0 * z);
       cap = 5.0;
       break;
-    case BANDIT_ARM_A2:
+    case BANDIT_ENERGY_LINEAR_SOFT:
       g = 0.5 * z;
       cap = 2.0;
       break;
-    case BANDIT_ARM_A3:
+    case BANDIT_ENERGY_LINEAR_MED:
       g = 1.0 * z;
       cap = 3.0;
       break;
-    case BANDIT_ARM_A4:
-      if (z >= 0.8) {
-        g = 2.0 * (z - 0.8);
-      } else {
-        g = 0.0;
-      }
+    case BANDIT_ENERGY_THRESHOLD:
+      g = (z >= 0.8) ? 2.0 * (z - 0.8) : 0.0;
       cap = 3.0;
       break;
-    case BANDIT_ARM_A5:
-      g = 0.0;
-      cap = 1.0;
-      break;
+    case BANDIT_ENERGY_FLAT:
     default:
       g = 0.0;
       cap = 1.0;
@@ -1818,52 +2740,72 @@ void bandit_log_window(afl_state_t *afl) {
   if (!b->log_header_written) {
     fprintf(b->log_fp,
             "ts_ms,arm_id,arm_label,effective_arm,mix_choice,reward,edges_term,rarity_term,"
-            "thrpt,thrpt_ref,thrpt_pen,delta_bits,delta_rarity,timeout_hz,"
-            "slow_hz,queued_paths,favored_ratio,p90_score,gate_factor,gate_bonus,dict_prob,"
+            "thrpt,thrpt_ref,thrpt_pen,thrpt_pen_eff,delta_bits,delta_rarity,timeout_hz,"
+            "slow_hz,queued_paths,favored_ratio,p90_score,gate_factor,gate_bonus,"
+            "gate_bonus_final,zero_prog_pen,has_progress,win_clamp_hi,win_guard_hits,win_trend_active,win_reward_zero,"
+            "dwell_windows,dwell_blocked,guard_arm,guard_penalty,guard_streak,zp_streak,zp_factor,zp_applied,dict_prob,"
             "x_vc,x_vr,x_thrpt,x_q,x_pf,x_pto,ucb_score,base_raw,"
             "alpha,use_contextual,gate_mult,gate_cap,revisit_cooldown_ms,rarity_decay,"
-            "rarity_ema,mix_p,dict_attempts,dict_taken,dict_attempts_total,"
+            "rarity_ema,mix_p,a6_k0,a6_k1,a6_k2,a6_p0,a6_p1,a6_p2,a6_choice,a6_to_a1,a6_to_a2,a6_q1,a6_q2,a6_pi,a6_eta_eff,"
+            "dict_attempts,dict_taken,dict_attempts_total,"
             "dict_taken_total,dict_enable,dict_baseline_prob,reward_alpha,"
             "reward_beta,reward_gamma,reward_c1,reward_c2,p90_valid,p90_n,"
             "linucb_invert_fail_last,linucb_rad_cap_hits_last,"
             "linucb_score_cap_hits_last,linucb_invert_fail_total,"
             "linucb_rad_cap_hits_total,linucb_score_cap_hits_total,"
-            "time_sec,edges_rate,rarity_rate\n");
+            "cur_window_ms,time_sec,edges_rate,rarity_rate,edges_per_exec,rarity_per_exec,tie_win,tie_total,a6_eta_stats,a6_eta_model,stag_bonus_boost,build_id\n");
     b->log_header_written = 1;
   }
 
   u64 queued_paths = afl->queued_items;
   double favored_ratio = queued_paths ? ((double)afl->queued_favored / (double)queued_paths) : 0.0;
+  const char *adarare_build_id = adarare_build_id_effective();
   
   u64 ts_ms = bandit_now_ms();
 
   fprintf(b->log_fp,
           "%llu,%u,%s,%u,%u,"
-          "%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f," 
+          "%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,"
           "%0.0f,%0.4f,%0.6f,%0.6f,"
           "%llu,%0.4f,"
-          "%0.6f,%0.6f,%0.6f,%u,"
+          "%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%u,%u,%u,%u,%u,%u,%u,%u,%0.6f,%u,%u,%0.6f,%u,%u,"
           "%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,"
           "%0.6f,%0.6f,"
-          "%0.4f,%u,%0.4f,%0.4f,%llu,%0.4f,%0.4f,%0.4f,%llu,%llu,"
-          "%llu,%llu,%u,%u,%0.4f,%0.4f,%0.4f,%0.4f,%0.4f,%u,%llu,"
+          "%0.4f,%u,%0.4f,%0.4f,%llu,%0.4f,%0.4f,%0.4f,%u,%u,%u,%0.6f,%0.6f,%0.6f,%u,%llu,%llu,"
+          "%0.6f,%0.6f,%0.6f,%0.6f,%llu,%llu,%llu,%llu,%u,%u,"
+          "%0.4f,%0.4f,%0.4f,%0.4f,%0.4f,%u,%llu,"
           "%llu,%llu,%llu,%llu,%llu,%llu,"
-          "%0.4f,%0.6f,%0.6f\n",
+          "%llu,%0.4f,%0.6f,%0.6f,%0.6f,%0.6f,%llu,%llu,%0.6f,%0.6f,%u,%s\n",
           (unsigned long long)ts_ms, b->last_arm_used,
           bandit_arm_label(b->last_arm_used), b->last_arm_eff_used,
           b->last_mix_choice,
           b->last_reward, b->last_edges_term, b->last_rarity_term, 
           b->last_thrpt, b->last_thrpt_ref, b->last_thrpt_pen,
+          b->last_thrpt_pen_eff,
           b->last_delta_bits, b->last_delta_rarity, b->last_timeout_hz, b->last_slow_hz,
           (unsigned long long)queued_paths, favored_ratio, b->last_p90_score,
-          b->last_gate_factor, b->last_gate_bonus, b->last_dict_prob,
+          b->last_gate_factor, b->last_gate_bonus, b->last_gate_bonus_final,
+          b->last_zero_prog_pen,
+          (unsigned int)b->last_win_has_progress, b->last_win_clamp_hi,
+          b->last_win_guard_hits, (unsigned int)b->last_win_trend_active,
+          (unsigned int)b->last_win_reward_zero, b->dwell_windows,
+          (unsigned int)b->last_dwell_blocked, b->last_guard_arm,
+          b->last_guard_penalty, b->last_guard_streak, b->last_zp_streak,
+          b->last_zp_factor, (unsigned int)b->last_zp_applied,
+          b->last_dict_prob,
           b->last_x[0], b->last_x[1],
           b->last_x[2], b->last_x[3], b->last_x[4], b->last_x[5],
           b->last_ucb_score, b->last_base_raw,
           b->alpha, (unsigned int)b->use_contextual, b->gate_multiplier,
           b->gate_cap, (unsigned long long)b->revisit_time_ms,
-          b->rarity_decay, b->rarity_ema, b->mix_p, b->last_dict_attempts,
-          b->last_dict_taken, (unsigned long long)afl->adarare_dict_attempts_total,
+          b->rarity_decay, b->rarity_ema, b->mix_p,
+          b->a6_topk[0], b->a6_topk[1], b->a6_topk[2], b->a6_topk_prob[0],
+          b->a6_topk_prob[1], b->a6_topk_prob[2], b->last_a6_choice,
+          (unsigned long long)b->a6_to_a1, (unsigned long long)b->a6_to_a2,
+          b->a6_q1, b->a6_q2, b->last_a6_pi_eff, b->last_a6_eta_eff,
+          (unsigned long long)b->last_dict_attempts,
+          (unsigned long long)b->last_dict_taken,
+          (unsigned long long)afl->adarare_dict_attempts_total,
           (unsigned long long)afl->adarare_dict_taken_total, b->dict_enable,
           b->dict_baseline_prob, b->reward_alpha, b->reward_beta,
           b->reward_gamma, b->reward_c1, b->reward_c2, b->last_p90_valid,
@@ -1873,7 +2815,13 @@ void bandit_log_window(afl_state_t *afl) {
           (unsigned long long)b->linucb_invert_fail_total,
           (unsigned long long)b->linucb_rad_cap_hits_total,
           (unsigned long long)b->linucb_score_cap_hits_total,
-          b->last_time_sec, b->last_edges_rate, b->last_rarity_rate);
+          (unsigned long long)b->last_cur_window_ms, b->last_time_sec,
+          b->last_edges_rate, b->last_rarity_rate,
+          b->last_edges_per_exec, b->last_rarity_per_exec,
+          (unsigned long long)b->tie_break_hits_win,
+          (unsigned long long)b->tie_break_hits_total,
+          b->last_a6_eta_stats, b->last_a6_eta_model,
+          (unsigned int)b->last_stag_bonus_boost, adarare_build_id);
 
   fflush(b->log_fp);
 }
@@ -1918,6 +2866,7 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
 
   const char *log_path = b->log_path ? (const char *)b->log_path : "";
   const char *build_id = afl->build_id[0] ? (const char *)afl->build_id : "unknown";
+  const char *adarare_build_id = adarare_build_id_effective();
 
   fprintf(fp,
           "{\n"
@@ -1954,6 +2903,8 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           BANDIT_P90_MIN_SAMPLES);
 
   json_print_escaped(fp, log_path);
+  fprintf(fp, ",\n  \"adarare_build_id\": ");
+  json_print_escaped(fp, adarare_build_id);
   fprintf(fp, ",\n  \"build_id\": ");
   json_print_escaped(fp, build_id);
   fprintf(fp, ",\n  \"afl_version\": ");

@@ -61,6 +61,12 @@ typedef struct bandit_arm_state {
   u64    last_selected_ms;    /* Last selection time (ms). */
   double last_thrpt;          /* Last observed throughput (execs/sec). */
   u64    last_seen_ms;        /* Timestamp of last throughput update (ms). */
+  u32    guard_streak;        /* Consecutive throughput-guard hits. */
+  u32    zp_streak;           /* Consecutive low-progress windows for this arm. */
+  double edges_ema;           /* EMA of edges/sec for coverage tie-break. */
+  double early_edges_ema;     /* EMA of early-phase edges/sec for tie-break. */
+  double edges_per_exec_ema;  /* EMA of edges/exec conversion efficiency. */
+  double rarity_per_exec_ema; /* EMA of rarity/exec conversion efficiency. */
   double A[6][6];      /* LinUCB design matrix per arm. */
   double b[6];         /* LinUCB target vector per arm. */
 
@@ -74,6 +80,8 @@ typedef struct bandit_state {
   u32 num_arms;
   u32 current_arm;
   u32 current_arm_eff; /* Frozen effective arm for current window (A6 -> A1/A2). */
+  u32 dwell_windows;   /* Consecutive windows spent on current arm. */
+  u32 last_selected_arm;
   bandit_arm_state_t *arms;
   void  *score_res;        /* Reservoir for reward samples */
   void  *edges_rate_res;   /* Per-arm reservoir array for edges/sec */
@@ -87,12 +95,18 @@ typedef struct bandit_state {
   u64 total_selections;
   double total_rounds;
   u64 window_ms;
+  u64 last_cur_window_ms;
   u64 win_start_time;
   u64 win_arm_ms[AFL_BANDIT_MAX_ARMS];
   u64 win_last_ts;
   u32 win_last_arm;
   u64 win_new_cov;
   u64 win_new_bits;
+  u32 win_clamp_hi;
+  u32 win_guard_hits;
+  u8  win_trend_active;
+  u8  win_reward_zero;
+  u8  win_has_progress;
   u64 win_execs;
   double win_novelty;
   double win_rarity_mass;
@@ -104,9 +118,18 @@ typedef struct bandit_state {
   double last_raw_reward;
   double last_gate_factor;
   double last_gate_bonus;
+  double last_gate_bonus_final;
+  double last_zero_prog_pen;
   u64    last_win_execs;
   u64    last_win_new_cov;
   u64    last_win_new_bits;
+  u32    last_win_clamp_hi;
+  u32    last_win_guard_hits;
+  u8     last_win_trend_active;
+  u8     last_win_reward_zero;
+  u8     last_win_has_progress;
+  u8     last_stag_bonus_boost;
+  u8     last_dwell_blocked;
   double last_win_novelty;
   double last_base_raw;
   double last_win_rarity_mass;
@@ -132,9 +155,25 @@ typedef struct bandit_state {
   u64    last_improve_ms;
   u64    last_revisit_ms;
   u32    stagnation_windows;
+  double stag_ema_reward;
+  double stag_ema_edges;
+  double stag_slope_reward;
+  double stag_slope_edges;
+  u8     stag_trend_inited;
+  u8     stag_trend_active;
   double rarity_decay;
   double rarity_ema;
   double mix_p;
+  u32    a6_topk[AFL_BANDIT_MAX_ARMS];
+  double a6_topk_prob[AFL_BANDIT_MAX_ARMS];
+  u32    last_a6_choice;
+  double a6_choice_pi;
+  u64    a6_to_a1;
+  u64    a6_to_a2;
+  double a6_q1;
+  double a6_q2;
+  u64    tie_break_hits_total;
+  u64    tie_break_hits_win;
   u64    win_time_us;
   u64    win_timeouts;
   u64    win_slow_execs;
@@ -159,6 +198,7 @@ typedef struct bandit_state {
   double last_thrpt;
   double last_thrpt_ref;
   double last_thrpt_pen;
+  double last_thrpt_pen_eff;
   double last_timeout_hz;
   double last_slow_hz;
   double last_delta_bits;
@@ -167,10 +207,22 @@ typedef struct bandit_state {
   double last_time_sec;
   double last_edges_rate;
   double last_rarity_rate;
+  double last_edges_per_exec;
+  double last_rarity_per_exec;
   double last_edges_term;
   double last_rarity_term;
   double last_x[6];
   double last_ucb_score;
+  double last_guard_penalty;
+  u32    last_guard_streak;
+  u32    last_guard_arm;
+  u32    last_zp_streak;
+  u8     last_zp_applied;
+  double last_zp_factor;
+  double last_a6_eta_eff;
+  double last_a6_eta_stats;
+  double last_a6_eta_model;
+  double last_a6_pi_eff;
   u64    linucb_invert_fail_total;
   u64    linucb_rad_cap_hits_total;
   u64    linucb_score_cap_hits_total;

@@ -649,6 +649,9 @@ typedef struct afl_state {
   u32    bandit_dict_prob;              /* Dict mutation intensity (0-100)  */
   u32    bandit_dict_enable;            /* Enable bandit dict control       */
   u32    adarare_dict_prob;             /* Effective dict prob (current)    */
+  s8     adarare_prefer_favored;        /* -1 non-favored, 0 neutral, 1 favored */
+  u8     adarare_prefer_new;            /* Prefer less-fuzzed/new seeds     */
+  u32    adarare_havoc_mul_pct;         /* Policy scaling for mutation energy */
   u64    adarare_dict_attempts_win;     /* Dict gate attempts (window)      */
   u64    adarare_dict_taken_win;        /* Dict gate taken (window)         */
   u64    adarare_dict_attempts_total;   /* Dict gate attempts (total)       */

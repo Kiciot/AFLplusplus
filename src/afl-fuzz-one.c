@@ -542,6 +542,13 @@ u8 fuzz_one_original(afl_state_t *afl) {
 
   perf_score = bandit_scale_score(&afl->bandit, perf_score,
                                   afl->havoc_max_mult * 100);
+  if (afl->adarare_havoc_mul_pct != 100) {
+    u64 scaled_perf =
+        ((u64)perf_score * (u64)afl->adarare_havoc_mul_pct + 99ULL) / 100ULL;
+    u64 perf_cap = (u64)afl->havoc_max_mult * 100ULL;
+    if (scaled_perf > perf_cap) { scaled_perf = perf_cap; }
+    perf_score = (u32)scaled_perf;
+  }
   orig_perf = perf_score;
 
   if (unlikely(perf_score <= 0 && afl->active_items > 1)) {
@@ -3720,6 +3727,13 @@ static u8 mopt_common_fuzzing(afl_state_t *afl, MOpt_globals_t MOpt_globals) {
 
   perf_score = bandit_scale_score(&afl->bandit, perf_score,
                                   afl->havoc_max_mult * 100);
+  if (afl->adarare_havoc_mul_pct != 100) {
+    u64 scaled_perf =
+        ((u64)perf_score * (u64)afl->adarare_havoc_mul_pct + 99ULL) / 100ULL;
+    u64 perf_cap = (u64)afl->havoc_max_mult * 100ULL;
+    if (scaled_perf > perf_cap) { scaled_perf = perf_cap; }
+    perf_score = (u32)scaled_perf;
+  }
   orig_perf = perf_score;
 
   if (unlikely(perf_score <= 0 && afl->active_items > 1)) {

@@ -3803,7 +3803,31 @@ int main(int argc, char **argv_orig, char **envp) {
 
           do {
 
-            afl->current_entry = select_next_queue_entry(afl);
+            u32 bias_retry = 0;
+            while (1) {
+
+              afl->current_entry = select_next_queue_entry(afl);
+              if (unlikely(afl->current_entry >= afl->queued_items)) { continue; }
+
+              struct queue_entry *cand = afl->queue_buf[afl->current_entry];
+              if (unlikely(!cand || cand->disabled)) { continue; }
+
+              u8 favored_ok = 1;
+              if (afl->adarare_prefer_favored > 0) {
+                favored_ok = cand->favored ? 1 : 0;
+              } else if (afl->adarare_prefer_favored < 0) {
+                favored_ok = cand->favored ? 0 : 1;
+              }
+
+              u8 new_ok = 1;
+              if (afl->adarare_prefer_new) {
+                new_ok = (!cand->was_fuzzed || cand->fuzz_level == 0) ? 1 : 0;
+              }
+
+              if ((favored_ok && new_ok) || bias_retry >= 8) { break; }
+              bias_retry++;
+
+            }
 
           } while (unlikely(afl->current_entry >= afl->queued_items));
 
