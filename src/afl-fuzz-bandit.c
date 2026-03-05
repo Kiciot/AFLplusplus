@@ -169,8 +169,23 @@
 #ifndef ADARARE_ZERO_PROGRESS_PENALTY
 #define ADARARE_ZERO_PROGRESS_PENALTY 0.015
 #endif
+#ifndef ADARARE_ZERO_PROGRESS_PENALTY_STAG_MUL
+#define ADARARE_ZERO_PROGRESS_PENALTY_STAG_MUL 0.50
+#endif
 #ifndef ADARARE_THRPT_PEN_IF_PROGRESS
 #define ADARARE_THRPT_PEN_IF_PROGRESS 0.10
+#endif
+#ifndef ADARARE_GATE_POS_EPS
+#define ADARARE_GATE_POS_EPS 1e-4
+#endif
+#ifndef ADARARE_REWARD_NEG_CAP
+#define ADARARE_REWARD_NEG_CAP 0.25
+#endif
+#ifndef ADARARE_REWARD_POS_CAP
+#define ADARARE_REWARD_POS_CAP 1.25
+#endif
+#ifndef ADARARE_CTX_EMA_ALPHA
+#define ADARARE_CTX_EMA_ALPHA 0.30
 #endif
 
 /* Pulls-based warmup before LinUCB scoring. */
@@ -189,6 +204,9 @@
 #ifndef ADARARE_MIN_DWELL_WINDOWS
 #define ADARARE_MIN_DWELL_WINDOWS 1
 #endif
+#ifndef ADARARE_DWELL_EMERGENCY_ZP_STREAK
+#define ADARARE_DWELL_EMERGENCY_ZP_STREAK 3U
+#endif
 #define ADARARE_WINDOW_MS_EARLY 4500ULL
 #define ADARARE_WINDOW_MS_LATE 8000ULL
 #define ADARARE_WINDOW_EARLY_ROUNDS 40U
@@ -204,6 +222,21 @@
 #define BANDIT_STAG_REWARD_SLOPE_EPS 0.002
 #define BANDIT_STAG_EDGES_SLOPE_EPS 0.005
 #define BANDIT_STAG_TREND_MIN_WINDOWS 8U
+#ifndef ADARARE_STAG_DYN_ENABLE
+#define ADARARE_STAG_DYN_ENABLE 1
+#endif
+#ifndef ADARARE_STAG_DYN_R1
+#define ADARARE_STAG_DYN_R1 2000.0
+#endif
+#ifndef ADARARE_STAG_DYN_R2
+#define ADARARE_STAG_DYN_R2 10000.0
+#endif
+#ifndef ADARARE_STAG_DYN_M1
+#define ADARARE_STAG_DYN_M1 3U
+#endif
+#ifndef ADARARE_STAG_DYN_M2
+#define ADARARE_STAG_DYN_M2 8U
+#endif
 
 /* Selection-side throughput guardrail for slow arms. */
 #define BANDIT_SEL_THRPT_GUARD 1
@@ -222,6 +255,9 @@
 
 /* Keep interval comfortably above BANDIT_P90_MIN_SAMPLES so P90 scaling stays active. */
 #define BANDIT_RESCALE_INTERVAL 256
+#ifndef ADARARE_P90_SIGNAL_EPS
+#define ADARARE_P90_SIGNAL_EPS 1e-9
+#endif
 
 #define BANDIT_MATRIX_VAL_CAP 1.0e12
 #define BANDIT_MATRIX_RESCALE_FACTOR 1.0e-6 /* Keep scaled entries in same order
@@ -234,6 +270,9 @@
 #define ADARARE_A6_MIX_EMA_ALPHA 0.2
 #define ADARARE_A6_TOPK 2
 #define ADARARE_A6_SOFTMAX_TEMP 1.20
+#ifndef ADARARE_A6_PI_FLOOR_FRAC
+#define ADARARE_A6_PI_FLOOR_FRAC 0.05
+#endif
 #define ADARARE_MIX_P_MIN 0.15
 #define ADARARE_MIX_P_MAX 0.85
 #define ADARARE_MIX_UPDATE_INTERVAL 4U
@@ -640,6 +679,7 @@ static inline double bandit_a6_choice_prob(const bandit_state_t *bandit,
 static void bandit_build_a6_topk(bandit_state_t *bandit) {
 
   if (!bandit || !bandit->arms || !bandit->num_arms) return;
+  bandit->last_a6_pi_floor = 0.0;
 
   double qvals[ADARARE_A6_TOPK];
   u32 filled = 0;
@@ -701,6 +741,17 @@ static void bandit_build_a6_topk(bandit_state_t *bandit) {
     sumw += w;
   }
 
+  double floor_frac = ADARARE_A6_PI_FLOOR_FRAC;
+  if (!isfinite(floor_frac) || floor_frac < 0.0) floor_frac = 0.0;
+  if (floor_frac > 1.0) floor_frac = 1.0;
+  double pi_floor = 0.0;
+  if (filled > 0) {
+    pi_floor = floor_frac / (double)filled;
+    if (!isfinite(pi_floor) || pi_floor < 0.0) pi_floor = 0.0;
+  }
+  bandit->last_a6_pi_floor = pi_floor;
+
+  /* first normalize */
   if (!isfinite(sumw) || sumw <= 0.0) {
     double uniform = 1.0 / (double)filled;
     for (u32 k = 0; k < filled; ++k) {
@@ -709,6 +760,22 @@ static void bandit_build_a6_topk(bandit_state_t *bandit) {
   } else {
     for (u32 k = 0; k < filled; ++k) {
       bandit->a6_topk_prob[k] /= sumw;
+    }
+  }
+
+  /* apply floor */
+  double sum2 = 0.0;
+  for (u32 k = 0; k < filled; ++k) {
+    if (bandit->a6_topk_prob[k] < pi_floor) {
+      bandit->a6_topk_prob[k] = pi_floor;
+    }
+    sum2 += bandit->a6_topk_prob[k];
+  }
+
+  /* renormalize */
+  if (sum2 > 0.0) {
+    for (u32 k = 0; k < filled; ++k) {
+      bandit->a6_topk_prob[k] /= sum2;
     }
   }
 
@@ -734,9 +801,11 @@ static void bandit_dbg_log_window(
     double edges_rate, double rarity_rate, double edges_per_exec,
     double rarity_per_exec, double p90_edges, double p90_rarity, double scale_c1,
     double scale_c2, u32 scale_arm, double penalty, double gate_factor,
-    double gate_bonus, double gate_bonus_final, double zero_prog_pen,
+    double gate_bonus, double gate_bonus_final, double gate_bonus_eff,
+    double zero_prog_pen,
     u8 has_progress, u8 stag_bonus_boost, u8 dwell_blocked,
-    double raw_reward, double final_reward, u8 forced_revisit) {
+    double raw_reward, double final_reward, const double raw_x[BANDIT_CTX_DIM],
+    const double smooth_x[BANDIT_CTX_DIM], u8 forced_revisit) {
 
   bandit_dbg_init();
   if (!bandit_dbg || !bandit || !bandit->arms) { return; }
@@ -750,14 +819,17 @@ static void bandit_dbg_log_window(
 
   fprintf(dbg_out,
           "[bandit dbg] now_ms=%llu window_ms=%llu arm_cur=%u arm_next=%u "
-          "arm_eff=%u warmup=%u stag_windows=%u trend_stag=%u "
+          "arm_eff=%u warmup=%u stag_windows=%u dyn_stag_thresh=%u trend_stag=%u "
+          "discount=%.6f "
           "slope_r=%.6f slope_e=%.6f stag_bonus_boost=%u forced_revisit=%u "
           "win_total_ms=%llu w_sum=%.4f new_cov=%llu new_bits=%llu "
           "clamp_hi=%u guard_hits=%u tie_win=%u tie_total=%llu reward_zero=%u "
-          "dwell_windows=%u dwell_blocked=%u\n",
+          "dwell_windows=%u dwell_blocked=%u dwell_emergency_zero=%u\n",
           (unsigned long long)now_ms, (unsigned long long)cur_window_ms,
           arm_cur, arm_next, bandit->current_arm_eff, (unsigned)bandit->in_warmup,
-          bandit->stagnation_windows, (unsigned)bandit->stag_trend_active,
+          bandit->stagnation_windows, bandit->last_dyn_stag_thresh,
+          (unsigned)bandit->stag_trend_active,
+          bandit->discount,
           bandit->stag_slope_reward, bandit->stag_slope_edges,
           (unsigned)stag_bonus_boost, forced_revisit,
           (unsigned long long)win_total_ms, wsum,
@@ -766,40 +838,50 @@ static void bandit_dbg_log_window(
           bandit->last_win_guard_hits, tie_break_hits,
           (unsigned long long)bandit->tie_break_hits_total,
           (unsigned)bandit->last_win_reward_zero, bandit->dwell_windows,
-          (unsigned)dwell_blocked);
+          (unsigned)dwell_blocked, (unsigned)bandit->last_dwell_emergency_zero);
 
   fprintf(dbg_out,
           "[bandit dbg] reward edges_rate=%.6f rarity_rate=%.6f penalty=%.6f "
           "edges_per_exec=%.6f rarity_per_exec=%.6f "
           "thrpt_pen=%.6f thrpt_pen_eff=%.6f gate_factor=%.6f gate_bonus=%.6f "
-          "zero_prog_pen=%.6f raw_reward=%.6f final_reward=%.6f "
-          "has_progress=%u gate_bonus_final=%.6f p90_arm=%u "
+          "zero_prog_pen=%.6f raw_reward_pre_cap=%.6f raw_reward=%.6f final_reward=%.6f "
+          "has_progress=%u gate_bonus_final=%.6f gate_bonus_eff=%.6f p90_arm=%u "
           "p90_edges=%.6f p90_rarity=%.6f scale_c1=%.6f "
-          "scale_c2=%.6f\n",
+          "scale_c2=%.6f p90_add_edges=%u p90_add_rarity=%u\n",
           edges_rate, rarity_rate, penalty, edges_per_exec, rarity_per_exec,
           bandit->last_thrpt_pen, bandit->last_thrpt_pen_eff, gate_factor,
-          gate_bonus, zero_prog_pen, raw_reward, final_reward,
-          (unsigned)has_progress, gate_bonus_final, scale_arm, p90_edges,
-          p90_rarity, scale_c1, scale_c2);
+          gate_bonus, zero_prog_pen, bandit->last_raw_reward_pre_cap, raw_reward,
+          final_reward,
+          (unsigned)has_progress, gate_bonus_final, gate_bonus_eff, scale_arm,
+          p90_edges,
+          p90_rarity, scale_c1, scale_c2, (unsigned)bandit->last_p90_add_edges,
+          (unsigned)bandit->last_p90_add_rarity);
 
   fprintf(dbg_out,
           "[bandit dbg] a6 mix_p=%.6f a6_to_a1=%llu a6_to_a2=%llu "
           "a6_q1=%.6f a6_q2=%.6f a6_pi=%.6f a6_eta_eff=%.6f "
+          "a6_pi_floor=%.6f "
           "a6_eta_stats=%.6f a6_eta_model=%.6f "
           "a6_choice=%u a6_choice_pi=%.6f "
           "a6_k0=%u a6_k1=%u a6_k2=%u a6_p0=%.6f a6_p1=%.6f a6_p2=%.6f\n",
           bandit->mix_p, (unsigned long long)bandit->a6_to_a1,
           (unsigned long long)bandit->a6_to_a2, bandit->a6_q1, bandit->a6_q2,
           bandit->last_a6_pi_eff, bandit->last_a6_eta_eff,
+          bandit->last_a6_pi_floor,
           bandit->last_a6_eta_stats, bandit->last_a6_eta_model,
           bandit->last_a6_choice, bandit->a6_choice_pi, bandit->a6_topk[0],
           bandit->a6_topk[1], bandit->a6_topk[2], bandit->a6_topk_prob[0],
           bandit->a6_topk_prob[1], bandit->a6_topk_prob[2]);
 
+  const double *raw_ctx = raw_x ? raw_x : bandit->last_raw_x;
+  const double *smooth_ctx = smooth_x ? smooth_x : bandit->last_x;
   fprintf(dbg_out,
-          "[bandit dbg] x x0=%.6f x1=%.6f x2=%.6f x3=%.6f x4=%.6f x5=%.6f\n",
-          bandit->last_x[0], bandit->last_x[1], bandit->last_x[2],
-          bandit->last_x[3], bandit->last_x[4], bandit->last_x[5]);
+          "[bandit dbg] ctx raw_x0=%.6f raw_x1=%.6f raw_x2=%.6f raw_x3=%.6f "
+          "raw_x4=%.6f raw_x5=%.6f x0=%.6f x1=%.6f x2=%.6f x3=%.6f x4=%.6f "
+          "x5=%.6f\n",
+          raw_ctx[0], raw_ctx[1], raw_ctx[2], raw_ctx[3], raw_ctx[4],
+          raw_ctx[5], smooth_ctx[0], smooth_ctx[1], smooth_ctx[2], smooth_ctx[3],
+          smooth_ctx[4], smooth_ctx[5]);
 
   for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
     double pulls = bandit->arms[i].pulls;
@@ -1157,9 +1239,11 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_win_gate = 1.0;
   bandit->last_win_gate_execavg = 1.0;
   bandit->last_raw_reward = 0.0;
+  bandit->last_raw_reward_pre_cap = 0.0;
   bandit->last_gate_factor = 1.0;
   bandit->last_gate_bonus = 0.0;
   bandit->last_gate_bonus_final = 0.0;
+  bandit->last_gate_bonus_eff = 0.0;
   bandit->last_zero_prog_pen = 0.0;
   bandit->last_win_clamp_hi = 0;
   bandit->last_win_guard_hits = 0;
@@ -1168,6 +1252,7 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_win_has_progress = 0;
   bandit->last_stag_bonus_boost = 0;
   bandit->last_dwell_blocked = 0;
+  bandit->last_dwell_emergency_zero = 0;
   bandit->last_guard_penalty = 1.0;
   bandit->last_guard_streak = 0;
   bandit->last_guard_arm = 0;
@@ -1180,7 +1265,8 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_a6_pi_eff = 0.0;
   
   bandit->rarity_norm = BANDIT_RARITY_NORM_PATH_LEN;
-  bandit->discount = 0.99; 
+  bandit->discount =
+      bandit_env_double("AFL_ADARARE_DISCOUNT", 0.999, 0.90, 1.0);
   bandit->warmup_windows = 20; 
   bandit->in_warmup = 1;
   bandit->mix_choice = 0;
@@ -1201,12 +1287,14 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_improve_ms = bandit->win_start_time;
   bandit->last_revisit_ms = 0;
   bandit->stagnation_windows = 0;
+  bandit->last_dyn_stag_thresh = BANDIT_STAG_WINDOWS;
   bandit->stag_ema_reward = 0.0;
   bandit->stag_ema_edges = 0.0;
   bandit->stag_slope_reward = 0.0;
   bandit->stag_slope_edges = 0.0;
   bandit->stag_trend_inited = 0;
   bandit->stag_trend_active = 0;
+  bandit->x_ema_inited = 0;
   bandit->rarity_decay = bandit_env_double("AFL_ADARARE_SCORE_DECAY",
                                            BANDIT_DEFAULT_RARITY_DECAY, 0.90,
                                            1.0);
@@ -1219,6 +1307,7 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   }
   bandit->last_a6_choice = 0;
   bandit->a6_choice_pi = 0.0;
+  bandit->last_a6_pi_floor = 0.0;
   bandit->a6_to_a1 = 0;
   bandit->a6_to_a2 = 0;
   bandit->a6_q1 = 0.0;
@@ -1255,6 +1344,8 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_p90_score = 1.0;
   bandit->last_p90_n = 0;
   bandit->last_p90_valid = 0;
+  bandit->last_p90_add_edges = 0;
+  bandit->last_p90_add_rarity = 0;
   bandit->thrpt_ref_ema = 0.0;
   bandit->thrpt_ref_inited = 0;
   bandit->log_fp = NULL;
@@ -1322,7 +1413,10 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
     bandit->arms[i].edges_per_exec_ema = 0.0;
     bandit->arms[i].rarity_per_exec_ema = 0.0;
   }
-  for (u32 k = 0; k < BANDIT_CTX_DIM; ++k) bandit->last_x[k] = 0.0;
+  for (u32 k = 0; k < BANDIT_CTX_DIM; ++k) {
+    bandit->last_raw_x[k] = 0.0;
+    bandit->last_x[k] = 0.0;
+  }
   
   bandit->score_res = ck_alloc(sizeof(bandit_reservoir_t));
   bandit->edges_rate_res = ck_alloc(arms * sizeof(bandit_reservoir_t));
@@ -1594,6 +1688,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   u32 r2 = bandit_get_random(bandit);
   u32 r3 = bandit_get_random(bandit);
   u32 r4 = bandit_get_random(bandit);
+  u8 p90_add_edges = 0;
+  u8 p90_add_rarity = 0;
 
   u32 res_arm = window_arm_eff;
   if (res_arm >= bandit->num_arms) {
@@ -1607,8 +1703,14 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit_reservoir_t *edges_res = &edges_res_arr[res_arm];
   bandit_reservoir_t *rarity_res = &rarity_res_arr[res_arm];
 
-  reservoir_add(edges_res, edges_rate, r1, r2);
-  reservoir_add(rarity_res, rarity_rate, r3, r4);
+  if (isfinite(edges_rate) && edges_rate > ADARARE_P90_SIGNAL_EPS) {
+    reservoir_add(edges_res, edges_rate, r1, r2);
+    p90_add_edges = 1;
+  }
+  if (isfinite(rarity_rate) && rarity_rate > ADARARE_P90_SIGNAL_EPS) {
+    reservoir_add(rarity_res, rarity_rate, r3, r4);
+    p90_add_rarity = 1;
+  }
 
   double p90_edges = reservoir_p90(edges_res);
   double p90_rarity = reservoir_p90(rarity_res);
@@ -1665,24 +1767,52 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
 #if BANDIT_PROGRESS_GATE_ENABLE
   if (!has_progress) gate_bonus_final = 0.0;
 #endif
-  
-  double raw_reward = rw_alpha * edges_term +
-                      rw_beta * rarity_term -
-                      rw_gamma * thrpt_pen_eff;
-  raw_reward += gate_bonus_final;
+
+  double positive_reward = rw_alpha * edges_term + rw_beta * rarity_term;
+  if (!isfinite(positive_reward) || positive_reward < 0.0) positive_reward = 0.0;
+  double gate_bonus_eff = 0.0;
+  if (positive_reward > ADARARE_GATE_POS_EPS) {
+    gate_bonus_eff = gate_bonus_final;
+  } else {
+    gate_bonus_eff = 0.0;
+  }
+  if (!isfinite(gate_bonus_eff) || gate_bonus_eff < 0.0) gate_bonus_eff = 0.0;
+  positive_reward *= (1.0 + gate_bonus_eff);
+  if (!isfinite(positive_reward) || positive_reward < 0.0) positive_reward = 0.0;
+
+  double raw_reward = positive_reward - rw_gamma * thrpt_pen_eff;
+  if (!isfinite(raw_reward)) raw_reward = 0.0;
   double zero_prog_pen = 0.0;
   if (!has_progress) {
     zero_prog_pen = ADARARE_ZERO_PROGRESS_PENALTY * zp_penalty_mul;
+    if (bandit->stag_trend_active) {
+      u32 pa = res_arm;
+      if (pa < bandit->num_arms &&
+          bandit->arms[pa].zp_streak >=
+              (u32)ADARARE_DWELL_EMERGENCY_ZP_STREAK) {
+        double zp_stag_mul = ADARARE_ZERO_PROGRESS_PENALTY_STAG_MUL;
+        if (!isfinite(zp_stag_mul) || zp_stag_mul < 0.0) zp_stag_mul = 0.0;
+        if (zp_stag_mul > 1.0) zp_stag_mul = 1.0;
+        zero_prog_pen *= zp_stag_mul;
+      }
+    }
     raw_reward -= zero_prog_pen;
   }
 
-  double raw_reward_pre_clamp = raw_reward;
-  
-  if (raw_reward < 0.0) raw_reward = 0.0;
-  if (raw_reward > 1.0) raw_reward = 1.0;
+  double raw_reward_pre_cap = raw_reward;
+  if (!isfinite(raw_reward_pre_cap)) raw_reward_pre_cap = 0.0;
   if (!isfinite(raw_reward)) raw_reward = 0.0;
 
-  bandit->win_clamp_hi = (raw_reward_pre_clamp > 1.0) ? 1U : 0U;
+  /* clamp raw_reward to keep LinUCB bounded */
+  if (raw_reward > ADARARE_REWARD_POS_CAP) raw_reward = ADARARE_REWARD_POS_CAP;
+  if (raw_reward < -ADARARE_REWARD_NEG_CAP) raw_reward = -ADARARE_REWARD_NEG_CAP;
+
+  if (raw_reward < 0.0) raw_reward = 0.0;
+  if (!isfinite(raw_reward)) raw_reward = 0.0;
+
+  bandit->last_raw_reward_pre_cap = raw_reward_pre_cap;
+  bandit->win_clamp_hi =
+      (raw_reward_pre_cap > ADARARE_REWARD_POS_CAP) ? 1U : 0U;
   bandit->win_reward_zero = (raw_reward <= 0.0) ? 1U : 0U;
   bandit->win_has_progress = has_progress;
 
@@ -1693,6 +1823,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_thrpt_ref = bandit->thrpt_ref_inited ? bandit->thrpt_ref_ema : thrpt;
   bandit->last_thrpt_pen = thrpt_pen;
   bandit->last_thrpt_pen_eff = thrpt_pen_eff;
+  bandit->last_p90_add_edges = p90_add_edges;
+  bandit->last_p90_add_rarity = p90_add_rarity;
   bandit->last_timeout_hz = timeout_hz;
   bandit->last_slow_hz = slow_hz;
   bandit->last_delta_bits = delta_bits;
@@ -1701,6 +1833,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_gate_factor = gate_factor;
   bandit->last_gate_bonus = gate_bonus;
   bandit->last_gate_bonus_final = gate_bonus_final;
+  bandit->last_gate_bonus_eff = gate_bonus_eff;
   bandit->last_zero_prog_pen = zero_prog_pen;
   
   bandit->last_time_sec = safe_time;
@@ -1989,6 +2122,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   u32 next_arm = bandit->current_arm;
   bandit_build_a6_topk(bandit);
   
+  double raw_x[BANDIT_CTX_DIM];
   double x[BANDIT_CTX_DIM];
   double vc = (double)bandit->last_win_new_bits / safe_time;
   double vr = bandit->last_win_rarity_mass / safe_time;
@@ -2006,14 +2140,36 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   }
   double p_timeout = (double)bandit->last_win_timeouts / (double)(bandit->last_win_execs ? bandit->last_win_execs : 1);
 
-  x[0] = bandit_clamp_feature(log1p(vc) * BANDIT_X0_SCALE);
-  x[1] = bandit_clamp_feature(log1p(vr) * BANDIT_X1_SCALE);
-  x[2] = bandit_clamp_feature(log1p(thrpt_ctx) * BANDIT_X2_SCALE);
-  x[3] = bandit_clamp_feature(log1p(q_rel) * BANDIT_X3_SCALE);
-  x[4] = bandit_clamp_feature(favored_ratio * BANDIT_X4_SCALE);
-  x[5] = bandit_clamp_feature(log1p(p_timeout) * BANDIT_X5_SCALE);
+  raw_x[0] = bandit_clamp_feature(log1p(vc) * BANDIT_X0_SCALE);
+  raw_x[1] = bandit_clamp_feature(log1p(vr) * BANDIT_X1_SCALE);
+  raw_x[2] = bandit_clamp_feature(log1p(thrpt_ctx) * BANDIT_X2_SCALE);
+  raw_x[3] = bandit_clamp_feature(log1p(q_rel) * BANDIT_X3_SCALE);
+  raw_x[4] = bandit_clamp_feature(favored_ratio * BANDIT_X4_SCALE);
+  raw_x[5] = bandit_clamp_feature(log1p(p_timeout) * BANDIT_X5_SCALE);
   for (int k = 0; k < BANDIT_CTX_DIM; ++k) {
-    bandit->last_x[k] = x[k];
+    if (!isfinite(raw_x[k])) raw_x[k] = 0.0;
+    bandit->last_raw_x[k] = raw_x[k];
+  }
+
+  double ctx_ema_alpha = ADARARE_CTX_EMA_ALPHA;
+  if (!isfinite(ctx_ema_alpha)) ctx_ema_alpha = 0.0;
+  if (ctx_ema_alpha < 0.0) ctx_ema_alpha = 0.0;
+  if (ctx_ema_alpha > 1.0) ctx_ema_alpha = 1.0;
+
+  if (!bandit->x_ema_inited) {
+    for (int k = 0; k < BANDIT_CTX_DIM; ++k) {
+      x[k] = raw_x[k];
+      bandit->last_x[k] = x[k];
+    }
+    bandit->x_ema_inited = 1;
+  } else {
+    for (int k = 0; k < BANDIT_CTX_DIM; ++k) {
+      double prev_x = bandit->last_x[k];
+      if (!isfinite(prev_x)) prev_x = raw_x[k];
+      x[k] = (1.0 - ctx_ema_alpha) * prev_x + ctx_ema_alpha * raw_x[k];
+      if (!isfinite(x[k])) x[k] = raw_x[k];
+      bandit->last_x[k] = x[k];
+    }
   }
 
   if (bandit->use_contextual) {
@@ -2149,6 +2305,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   u32 guard_hits = 0;
   u32 tie_break_hits = 0;
   u8 dwell_blocked = 0;
+  u8 dwell_emergency_zero = 0;
   for (u32 i = 0; i < AFL_BANDIT_MAX_ARMS; ++i) {
     score_pred_dbg[i] = NAN;
     score_bonus_dbg[i] = NAN;
@@ -2161,7 +2318,23 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   }
 
   bandit->in_warmup = bandit_in_pulls_warmup(bandit);
-  u8 stagnating = (bandit->stagnation_windows >= BANDIT_STAG_WINDOWS) ? 1 : 0;
+  u32 dyn_stag_thresh = BANDIT_STAG_WINDOWS;
+#if ADARARE_STAG_DYN_ENABLE
+  double rounds = bandit->total_rounds;
+  if (!isfinite(rounds) || rounds < 0.0) rounds = 0.0;
+  u32 dyn_thresh_m1 = BANDIT_STAG_WINDOWS * ADARARE_STAG_DYN_M1;
+  u32 dyn_thresh_m2 = BANDIT_STAG_WINDOWS * ADARARE_STAG_DYN_M2;
+  if (!dyn_thresh_m1) dyn_thresh_m1 = BANDIT_STAG_WINDOWS;
+  if (!dyn_thresh_m2) dyn_thresh_m2 = BANDIT_STAG_WINDOWS;
+  if (rounds > ADARARE_STAG_DYN_R2) {
+    dyn_stag_thresh = dyn_thresh_m2;
+  } else if (rounds > ADARARE_STAG_DYN_R1) {
+    dyn_stag_thresh = dyn_thresh_m1;
+  }
+#endif
+  if (!dyn_stag_thresh) dyn_stag_thresh = BANDIT_STAG_WINDOWS;
+  bandit->last_dyn_stag_thresh = dyn_stag_thresh;
+  u8 stagnating = (bandit->stagnation_windows >= dyn_stag_thresh) ? 1 : 0;
   u8 force_revisit = 0;
   u8 stag_bonus_boost = 0;
   bandit->last_stag_bonus_boost = 0;
@@ -2176,16 +2349,18 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     force_revisit = 1;
   } else {
     double best_score = -DBL_MAX;
-    double best_cov_early = -DBL_MAX;
-    double best_cov = -DBL_MAX;
-    double best_cov_exec = -DBL_MAX;
+    double best_early_edges_metric = 0.0;
+    double best_edges_metric = 0.0;
+    double best_rarity_metric = 0.0;
+    double best_eff_metric = 0.0;
+    double best_speed_metric = 0.0;
     double log_t =
         log((double)(bandit->total_selections > 1 ? bandit->total_selections : 1));
     double stagnation_bonus_mul = 1.0;
     if (stagnating) {
       double over =
-          (double)(bandit->stagnation_windows - BANDIT_STAG_WINDOWS + 1U);
-      double ramp = over / (double)BANDIT_STAG_WINDOWS;
+          (double)(bandit->stagnation_windows - dyn_stag_thresh + 1U);
+      double ramp = over / (double)dyn_stag_thresh;
       if (ramp > 1.0) ramp = 1.0;
       stagnation_bonus_mul = 1.0 + (BANDIT_STAG_BOOST - 1.0) * ramp;
     }
@@ -2326,51 +2501,92 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
         score_zp_applied_dbg[i] = zp_applied;
       }
 
-      double cov_metric = bandit->arms[i].edges_ema;
-      if (!isfinite(cov_metric) || cov_metric < 0.0) cov_metric = 0.0;
-      double cov_metric_early = bandit->arms[i].early_edges_ema;
-      if (!isfinite(cov_metric_early) || cov_metric_early < 0.0) {
-        cov_metric_early = 0.0;
+      double cur_pulls_metric = bandit->arms[i].pulls;
+      if (!isfinite(cur_pulls_metric) || cur_pulls_metric < 0.0) {
+        cur_pulls_metric = 0.0;
       }
-      double cov_metric_exec = bandit->arms[i].edges_per_exec_ema;
-      if (!isfinite(cov_metric_exec) || cov_metric_exec < 0.0) {
-        cov_metric_exec = 0.0;
+      double cur_early_edges = bandit->arms[i].early_edges_ema;
+      if (!isfinite(cur_early_edges) || cur_early_edges < 0.0) {
+        cur_early_edges = 0.0;
       }
+      if (cur_pulls_metric >= ADARARE_EARLY_EDGES_PULLS_CUTOFF) {
+        cur_early_edges = 0.0;
+      }
+      double cur_edges = bandit->arms[i].edges_ema;
+      if (!isfinite(cur_edges) || cur_edges < 0.0) cur_edges = 0.0;
+      double cur_rarity = bandit->arms[i].rarity_per_exec_ema;
+      if (!isfinite(cur_rarity) || cur_rarity < 0.0) cur_rarity = 0.0;
+      double cur_eff = bandit->arms[i].edges_per_exec_ema;
+      if (!isfinite(cur_eff) || cur_eff < 0.0) cur_eff = 0.0;
+      double cur_speed = bandit->arms[i].last_thrpt;
+      if (!isfinite(cur_speed) || cur_speed < 0.0) cur_speed = 0.0;
 
       double tie_eps = ADARARE_TIE_EPS_REL * fmax(1.0, best_score);
       if (score > best_score + tie_eps) {
         best_score = score;
-        best_cov_early = cov_metric_early;
-        best_cov = cov_metric;
-        best_cov_exec = cov_metric_exec;
+        best_early_edges_metric = cur_early_edges;
+        best_edges_metric = cur_edges;
+        best_rarity_metric = cur_rarity;
+        best_eff_metric = cur_eff;
+        best_speed_metric = cur_speed;
         next_arm = i;
       } else if (ADARARE_ENABLE_TIE_BREAK &&
-                 fabs(score - best_score) <= tie_eps &&
-                 (cov_metric_early >
-                      best_cov_early + BANDIT_PULLS_EPSILON ||
-                  (fabs(cov_metric_early - best_cov_early) <=
-                       BANDIT_PULLS_EPSILON &&
-                   (cov_metric > best_cov + BANDIT_PULLS_EPSILON ||
-                    (fabs(cov_metric - best_cov) <= BANDIT_PULLS_EPSILON &&
-                     cov_metric_exec >
-                         best_cov_exec + BANDIT_PULLS_EPSILON))))) {
-        best_cov_early = cov_metric_early;
-        best_cov = cov_metric;
-        best_cov_exec = cov_metric_exec;
-        next_arm = i;
-        tie_break_hits++;
-        bandit->tie_break_hits_total++;
+                 fabs(score - best_score) <= tie_eps) {
+        u8 is_better_tie = 0;
+        if (cur_early_edges > best_early_edges_metric + BANDIT_PULLS_EPSILON) {
+          is_better_tie = 1;
+        } else if (fabs(cur_early_edges - best_early_edges_metric) <=
+                   BANDIT_PULLS_EPSILON) {
+          if (cur_edges > best_edges_metric + BANDIT_PULLS_EPSILON) {
+            is_better_tie = 1;
+          } else if (fabs(cur_edges - best_edges_metric) <=
+                     BANDIT_PULLS_EPSILON) {
+            if (cur_rarity > best_rarity_metric + BANDIT_PULLS_EPSILON) {
+              is_better_tie = 1;
+            } else if (fabs(cur_rarity - best_rarity_metric) <=
+                       BANDIT_PULLS_EPSILON) {
+              if (cur_eff > best_eff_metric + BANDIT_PULLS_EPSILON) {
+                is_better_tie = 1;
+              } else if (fabs(cur_eff - best_eff_metric) <=
+                             BANDIT_PULLS_EPSILON &&
+                         cur_speed > best_speed_metric + BANDIT_PULLS_EPSILON) {
+                is_better_tie = 1;
+              }
+            }
+          }
+        }
+
+        if (is_better_tie) {
+          best_early_edges_metric = cur_early_edges;
+          best_edges_metric = cur_edges;
+          best_rarity_metric = cur_rarity;
+          best_eff_metric = cur_eff;
+          best_speed_metric = cur_speed;
+          next_arm = i;
+          tie_break_hits++;
+          bandit->tie_break_hits_total++;
+        }
       }
     }
   }
 
+  if (prev_arm_idx < bandit->num_arms) {
+    dwell_emergency_zero =
+        (bandit->arms[prev_arm_idx].zp_streak >=
+         (u32)ADARARE_DWELL_EMERGENCY_ZP_STREAK)
+            ? 1
+            : 0;
+  }
+
   if (!bandit->in_warmup && !force_revisit && !bandit->stag_trend_active &&
+      !dwell_emergency_zero &&
       next_arm != prev_arm_idx &&
       bandit->dwell_windows < ADARARE_MIN_DWELL_WINDOWS) {
     next_arm = prev_arm_idx;
     dwell_blocked = 1;
   }
   bandit->last_dwell_blocked = dwell_blocked;
+  bandit->last_dwell_emergency_zero = dwell_emergency_zero;
 
   if (next_arm < AFL_BANDIT_MAX_ARMS && !isfinite(score_total_dbg[next_arm])) {
     score_pred_dbg[next_arm] = bandit_arm_mean_reward(&bandit->arms[next_arm]);
@@ -2458,9 +2674,10 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
       rarity_rate, edges_per_exec, rarity_per_exec,
       p90_edges, p90_rarity,
       scale_c1, scale_c2, res_arm, rw_gamma * thrpt_pen_eff,
-      gate_factor, gate_bonus, gate_bonus_final, zero_prog_pen, has_progress,
+      gate_factor, gate_bonus, gate_bonus_final, gate_bonus_eff, zero_prog_pen,
+      has_progress,
       stag_bonus_boost, dwell_blocked, raw_reward,
-      final_reward, force_revisit);
+      final_reward, raw_x, x, force_revisit);
 
   if (bandit->owner) {
     bandit->last_dict_attempts = bandit->owner->adarare_dict_attempts_win;
@@ -2753,7 +2970,9 @@ void bandit_log_window(afl_state_t *afl) {
             "linucb_invert_fail_last,linucb_rad_cap_hits_last,"
             "linucb_score_cap_hits_last,linucb_invert_fail_total,"
             "linucb_rad_cap_hits_total,linucb_score_cap_hits_total,"
-            "cur_window_ms,time_sec,edges_rate,rarity_rate,edges_per_exec,rarity_per_exec,tie_win,tie_total,a6_eta_stats,a6_eta_model,stag_bonus_boost,build_id\n");
+            "cur_window_ms,time_sec,edges_rate,rarity_rate,edges_per_exec,rarity_per_exec,tie_win,tie_total,a6_eta_stats,a6_eta_model,stag_bonus_boost,build_id,"
+            "raw_x0,raw_x1,raw_x2,raw_x3,raw_x4,raw_x5,x0,x1,x2,x3,x4,x5,gate_bonus_eff,"
+            "raw_reward_pre_cap,a6_pi_floor,dwell_emergency_zero,p90_add_edges,p90_add_rarity,discount,dyn_stag_thresh\n");
     b->log_header_written = 1;
   }
 
@@ -2775,7 +2994,9 @@ void bandit_log_window(afl_state_t *afl) {
           "%0.6f,%0.6f,%0.6f,%0.6f,%llu,%llu,%llu,%llu,%u,%u,"
           "%0.4f,%0.4f,%0.4f,%0.4f,%0.4f,%u,%llu,"
           "%llu,%llu,%llu,%llu,%llu,%llu,"
-          "%llu,%0.4f,%0.6f,%0.6f,%0.6f,%0.6f,%llu,%llu,%0.6f,%0.6f,%u,%s\n",
+          "%llu,%0.4f,%0.6f,%0.6f,%0.6f,%0.6f,%llu,%llu,%0.6f,%0.6f,%u,%s,"
+          "%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,"
+          "%0.6f,%0.6f,%u,%u,%u,%0.6f,%u\n",
           (unsigned long long)ts_ms, b->last_arm_used,
           bandit_arm_label(b->last_arm_used), b->last_arm_eff_used,
           b->last_mix_choice,
@@ -2821,7 +3042,15 @@ void bandit_log_window(afl_state_t *afl) {
           (unsigned long long)b->tie_break_hits_win,
           (unsigned long long)b->tie_break_hits_total,
           b->last_a6_eta_stats, b->last_a6_eta_model,
-          (unsigned int)b->last_stag_bonus_boost, adarare_build_id);
+          (unsigned int)b->last_stag_bonus_boost, adarare_build_id,
+          b->last_raw_x[0], b->last_raw_x[1], b->last_raw_x[2], b->last_raw_x[3],
+          b->last_raw_x[4], b->last_raw_x[5], b->last_x[0], b->last_x[1],
+          b->last_x[2], b->last_x[3], b->last_x[4], b->last_x[5],
+          b->last_gate_bonus_eff, b->last_raw_reward_pre_cap,
+          b->last_a6_pi_floor, (unsigned int)b->last_dwell_emergency_zero,
+          (unsigned int)b->last_p90_add_edges,
+          (unsigned int)b->last_p90_add_rarity, b->discount,
+          b->last_dyn_stag_thresh);
 
   fflush(b->log_fp);
 }

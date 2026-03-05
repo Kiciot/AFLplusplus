@@ -116,9 +116,11 @@ typedef struct bandit_state {
   u64    win_gate_exec_samples;
   double last_reward;
   double last_raw_reward;
+  double last_raw_reward_pre_cap;
   double last_gate_factor;
   double last_gate_bonus;
   double last_gate_bonus_final;
+  double last_gate_bonus_eff;
   double last_zero_prog_pen;
   u64    last_win_execs;
   u64    last_win_new_cov;
@@ -130,6 +132,7 @@ typedef struct bandit_state {
   u8     last_win_has_progress;
   u8     last_stag_bonus_boost;
   u8     last_dwell_blocked;
+  u8     last_dwell_emergency_zero;
   double last_win_novelty;
   double last_base_raw;
   double last_win_rarity_mass;
@@ -155,6 +158,7 @@ typedef struct bandit_state {
   u64    last_improve_ms;
   u64    last_revisit_ms;
   u32    stagnation_windows;
+  u32    last_dyn_stag_thresh;
   double stag_ema_reward;
   double stag_ema_edges;
   double stag_slope_reward;
@@ -168,6 +172,7 @@ typedef struct bandit_state {
   double a6_topk_prob[AFL_BANDIT_MAX_ARMS];
   u32    last_a6_choice;
   double a6_choice_pi;
+  double last_a6_pi_floor;
   u64    a6_to_a1;
   u64    a6_to_a2;
   double a6_q1;
@@ -211,7 +216,9 @@ typedef struct bandit_state {
   double last_rarity_per_exec;
   double last_edges_term;
   double last_rarity_term;
+  double last_raw_x[6];
   double last_x[6];
+  u8     x_ema_inited;
   double last_ucb_score;
   double last_guard_penalty;
   u32    last_guard_streak;
@@ -240,6 +247,8 @@ typedef struct bandit_state {
   u64    last_dict_taken;
   u32    last_p90_n;
   u8     last_p90_valid;
+  u8     last_p90_add_edges;
+  u8     last_p90_add_rarity;
   double score_sample[BANDIT_SCORE_SAMPLE_N];
   u32    score_sample_cnt;
   u64    score_sample_seen;
