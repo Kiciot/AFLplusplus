@@ -52,9 +52,16 @@ typedef enum {
   BANDIT_ARM_A6 = 5
 } bandit_arm_id_t;
 
+typedef enum {
+  BANDIT_A6_OFFPOLICY_FIXED = 0,
+  BANDIT_A6_OFFPOLICY_IPS = 1,
+  BANDIT_A6_OFFPOLICY_CLIPPED_IPS = 2
+} bandit_a6_offpolicy_mode_t;
+
 typedef struct bandit_arm_state {
 
   double pulls;        /* Discounted execution weight for UCB. */
+  double warmup_pulls; /* Monotonic pulls used for warmup scheduling. */
   double total_reward; /* Discounted total reward. */
   u64    selections;   /* Non-discounted selection count. */
   u64    last_selected_round; /* Last global selection round. */
@@ -86,6 +93,7 @@ typedef struct bandit_state {
   void  *score_res;        /* Reservoir for reward samples */
   void  *edges_rate_res;   /* Per-arm reservoir array for edges/sec */
   void  *rarity_rate_res;  /* Per-arm reservoir array for rarity/sec */
+  void  *cmplog_rate_res;  /* Per-arm reservoir for CMPLOG rate P90 normalization */
   u8     verify_enabled;   /* Enable verification logging */
   u8     rng_seeded_from_owner; /* Whether RNG seeded from owner */
   u32    rng_log_idx;      /* Logged RNG outputs count */
@@ -110,6 +118,10 @@ typedef struct bandit_state {
   u64 win_execs;
   double win_novelty;
   double win_rarity_mass;
+  double win_cmplog_progress; /* accumulated continuous branch-distance progress for current window */
+  u64    win_cmplog_inject_count;
+  double win_cmplog_inject_sum;
+  u64    win_cmplog_inject_clipped_count;
   u64    win_rarity_samples;
   u64    win_path_len_sum;
   double win_gate_exec_sum;
@@ -121,6 +133,9 @@ typedef struct bandit_state {
   double last_gate_bonus;
   double last_gate_bonus_final;
   double last_gate_bonus_eff;
+  double last_gate_bonus_headroom;
+  double last_gate_bonus_inject;
+  u8     last_gate_progress_gated;
   double last_zero_prog_pen;
   u64    last_win_execs;
   u64    last_win_new_cov;
@@ -147,6 +162,8 @@ typedef struct bandit_state {
   double gamma;
   double discount;
   u64    warmup_windows;
+  double warmup_pulls_target;
+  double last_warmup_min_pulls;
   u8     in_warmup;
   u8     mix_choice; /* Used when current_arm == BANDIT_ARM_A6 */
   u8     last_mix_choice;
@@ -168,6 +185,7 @@ typedef struct bandit_state {
   double rarity_decay;
   double rarity_ema;
   double mix_p;
+  bandit_a6_offpolicy_mode_t a6_offpolicy_mode;
   u32    a6_topk[AFL_BANDIT_MAX_ARMS];
   double a6_topk_prob[AFL_BANDIT_MAX_ARMS];
   u32    last_a6_choice;
@@ -179,6 +197,10 @@ typedef struct bandit_state {
   double a6_q2;
   u64    tie_break_hits_total;
   u64    tie_break_hits_win;
+  u64    tie_break_det_hits_total;
+  u64    tie_break_det_hits_win;
+  u8     last_tie_break_det;
+  double last_tie_eps;
   u64    win_time_us;
   u64    win_timeouts;
   u64    win_slow_execs;
@@ -212,6 +234,16 @@ typedef struct bandit_state {
   double last_time_sec;
   double last_edges_rate;
   double last_rarity_rate;
+  double last_cmplog_rate;
+  double last_cmplog_term;
+  double last_cmplog_mod;
+  double last_cmplog_rate_norm;
+  u64    last_cmplog_inject_count;
+  double last_cmplog_inject_sum;
+  u64    last_cmplog_inject_clipped_count;
+  double last_scale_c3_used;
+  double last_p90_cmplog;
+  double last_reward_delta_used;
   double last_edges_per_exec;
   double last_rarity_per_exec;
   double last_edges_term;
@@ -230,6 +262,12 @@ typedef struct bandit_state {
   double last_a6_eta_stats;
   double last_a6_eta_model;
   double last_a6_pi_eff;
+  double last_a6_ips_w;
+  u32    last_a6_eff_arm;
+  double last_mix_p_used;
+  double last_mix_p_next;
+  double a6_sub_progress_ema;
+  u64    a6_sub_samples;
   u64    linucb_invert_fail_total;
   u64    linucb_rad_cap_hits_total;
   u64    linucb_score_cap_hits_total;
@@ -262,8 +300,20 @@ typedef struct bandit_state {
   double reward_alpha;
   double reward_beta;
   double reward_gamma;
+  double reward_delta; /* CMPLOG continuous reward weight */
   double reward_c1;
   double reward_c2;
+  double reward_c3;    /* CMPLOG reward scaling baseline */
+  u8     cmp_reward;   /* enable/disable cmp continuous reward pipeline */
+  u8     cmp_producer_mode; /* 0 off, 1 byte-only, 2 distance+fallback */
+  u8     cmp_a3_boost; /* enable A3-specific cmp delta boost */
+  double cmp_min_gain; /* minimum producer gain required for injection */
+  double cmp_win_clip; /* per-window clip for cmplog progress accumulation */
+  u8     cmp_one_shot_site; /* optional one-shot per compare site per window */
+  double cmp_rarity_lambda; /* rarity modulation factor for cmp term */
+  u8     cmp_baseline_norm; /* normalize cmp rate by baseline scale/ema */
+  double cmp_baseline_ema;  /* ema factor for cmp baseline rate tracking */
+  double cmplog_rate_ema;   /* window-level EMA of cmp progress rate */
 
 } bandit_state_t;
 
@@ -276,6 +326,7 @@ void bandit_on_rarity_mass(bandit_state_t *bandit, double rarity_mass,
 void bandit_on_exec_gate(bandit_state_t *bandit, double gate);
 void bandit_on_exec(bandit_state_t *bandit, u64 execs, u64 time_us,
                     u64 timeouts, u64 slow_execs);
+void bandit_on_cmplog_progress(bandit_state_t *bandit, double progress_delta);
 u8 bandit_maybe_rotate(bandit_state_t *bandit);
 double bandit_current_multiplier(const bandit_state_t *bandit);
 u32 bandit_scale_score(bandit_state_t *bandit, u32 base_score, u32 cap);
