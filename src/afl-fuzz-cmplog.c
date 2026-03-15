@@ -25,6 +25,8 @@
  */
 
 #include "afl-fuzz.h"
+#include <limits.h>
+#include <math.h>
 #include "cmplog.h"
 
 enum {
