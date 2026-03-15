@@ -92,209 +92,52 @@ static u32 hshape;
 static u64 screen_update;
 static u64 last_update;
 
+void cmplog_reset_runtime_progress(void);
+
+#ifdef CMPLOG_COMBINE
+static u8  *cmplog_combine_buf;
+static u32  cmplog_combine_len;
+static u32  cmplog_combine_cap;
+
+static inline u8 *cmplog_ensure_combine_buf(afl_state_t *afl, u32 need_len) {
+
+  u32 new_cap = cmplog_combine_cap;
+  if (new_cap >= need_len && cmplog_combine_buf) { return cmplog_combine_buf; }
+  if (new_cap < 64U) new_cap = 64U;
+  while (new_cap < need_len) {
+    u32 next_cap = new_cap << 1;
+    if (next_cap <= new_cap) {
+      new_cap = need_len;
+      break;
+    }
+    new_cap = next_cap;
+  }
+
+  cmplog_combine_buf =
+      afl_realloc((void **)&afl->in_scratch_buf, (size_t)new_cap);
+  if (unlikely(!cmplog_combine_buf)) { PFATAL("alloc"); }
+  cmplog_combine_cap = new_cap;
+  return cmplog_combine_buf;
+
+}
+
+static inline void cmplog_sync_combine_buf(afl_state_t *afl, const u8 *src,
+                                           u32 src_len) {
+
+  u8 *dst = cmplog_ensure_combine_buf(afl, src_len);
+  memcpy(dst, src, src_len);
+  cmplog_combine_len = src_len;
+
+}
+
+#endif
+
 #ifdef USE_HASHMAP
 // hashmap functions
 void hashmap_reset();
 bool hashmap_search_and_add(uint8_t type, uint64_t key);
 bool hashmap_search_and_add_ptr(uint8_t type, u8 *key);
 #endif
-
-static inline u64 cmplog_abs_diff_u64(u64 lhs, u64 rhs) {
-
-  return (lhs >= rhs) ? (lhs - rhs) : (rhs - lhs);
-
-}
-
-static inline u64 cmplog_shape_mask(u32 shape_bytes) {
-
-  if (!shape_bytes) return 0;
-  if (shape_bytes >= sizeof(u64)) return ULLONG_MAX;
-  return (1ULL << (shape_bytes * 8)) - 1ULL;
-
-}
-
-static inline u32 cmplog_count_equal_bytes(const u8 *lhs, const u8 *rhs,
-                                           u32 nbytes) {
-
-  u32 matched = 0;
-  for (u32 i = 0; i < nbytes; ++i) {
-    if (lhs[i] == rhs[i]) matched++;
-  }
-
-  return matched;
-
-}
-
-static inline double cmplog_compress_gain(u64 gain) {
-
-  if (!gain) return 0.0;
-  double progress = log1p((double)gain);
-  if (!isfinite(progress) || progress <= 0.0) return 0.0;
-  return progress;
-
-}
-
-static inline double cmplog_progress_from_ins_observation(
-    const struct cmp_header *h, const struct cmp_operands *orig_o,
-    const struct cmp_operands *o, u64 *best_dist, u8 *best_dist_valid,
-    u32 *best_match, u8 *best_match_valid, u8 producer_mode) {
-
-  if (!h || !orig_o || !o) return 0.0;
-
-  u32 shape_bytes = SHAPE_BYTES(h->shape);
-  if (!shape_bytes) return 0.0;
-
-  /* Integer-distance reduction path: we can safely compute |lhs-rhs| for
-     integer-like compares up to 64-bit width. */
-  if (producer_mode != 1 && shape_bytes <= sizeof(u64) &&
-      !(h->attribute & IS_FP)) {
-
-    u64 mask = cmplog_shape_mask(shape_bytes);
-    u64 old_lhs = orig_o->v0 & mask;
-    u64 old_rhs = orig_o->v1 & mask;
-    u64 new_lhs = o->v0 & mask;
-    u64 new_rhs = o->v1 & mask;
-    u64 old_dist = cmplog_abs_diff_u64(old_lhs, old_rhs);
-    u64 new_dist = cmplog_abs_diff_u64(new_lhs, new_rhs);
-    u64 ref_dist = old_dist;
-
-    if (*best_dist_valid && *best_dist < ref_dist) ref_dist = *best_dist;
-    if (!*best_dist_valid || new_dist < *best_dist) {
-      *best_dist = new_dist;
-      *best_dist_valid = 1;
-    }
-
-    if (ref_dist > new_dist) {
-      /* Emit only genuine improvement to avoid noisy inflation. */
-      return cmplog_compress_gain(ref_dist - new_dist);
-    }
-
-    return 0.0;
-
-  }
-
-  /* Byte-match fallback path for compare classes where distance arithmetic is
-     not clear/safe (e.g. FP/vector/opaque routines). */
-  u8 old_lhs[32];
-  u8 old_rhs[32];
-  u8 new_lhs[32];
-  u8 new_rhs[32];
-  u32 capped_bytes = shape_bytes > 32 ? 32 : shape_bytes;
-
-  memcpy(old_lhs, &orig_o->v0, 8);
-  memcpy(old_lhs + 8, &orig_o->v0_128, 8);
-  memcpy(old_lhs + 16, &orig_o->v0_256_0, 8);
-  memcpy(old_lhs + 24, &orig_o->v0_256_1, 8);
-  memcpy(old_rhs, &orig_o->v1, 8);
-  memcpy(old_rhs + 8, &orig_o->v1_128, 8);
-  memcpy(old_rhs + 16, &orig_o->v1_256_0, 8);
-  memcpy(old_rhs + 24, &orig_o->v1_256_1, 8);
-  memcpy(new_lhs, &o->v0, 8);
-  memcpy(new_lhs + 8, &o->v0_128, 8);
-  memcpy(new_lhs + 16, &o->v0_256_0, 8);
-  memcpy(new_lhs + 24, &o->v0_256_1, 8);
-  memcpy(new_rhs, &o->v1, 8);
-  memcpy(new_rhs + 8, &o->v1_128, 8);
-  memcpy(new_rhs + 16, &o->v1_256_0, 8);
-  memcpy(new_rhs + 24, &o->v1_256_1, 8);
-
-  u32 old_match = cmplog_count_equal_bytes(old_lhs, old_rhs, capped_bytes);
-  u32 new_match = cmplog_count_equal_bytes(new_lhs, new_rhs, capped_bytes);
-  u32 ref_match = old_match;
-
-  if (*best_match_valid && *best_match > ref_match) ref_match = *best_match;
-  if (!*best_match_valid || new_match > *best_match) {
-    *best_match = new_match;
-    *best_match_valid = 1;
-  }
-
-  if (new_match > ref_match) {
-    /* Emit only positive gain; regressions/no-change are ignored. */
-    return cmplog_compress_gain((u64)(new_match - ref_match));
-  }
-
-  return 0.0;
-
-}
-
-static inline double cmplog_progress_from_rtn_observation(
-    const struct cmpfn_operands *orig_o, const struct cmpfn_operands *o,
-    u32 shape_bytes, u32 *best_match, u8 *best_match_valid) {
-
-  if (!orig_o || !o || !shape_bytes) return 0.0;
-
-  u32 capped_bytes = shape_bytes > 32 ? 32 : shape_bytes;
-  u32 old_match = cmplog_count_equal_bytes(orig_o->v0, orig_o->v1, capped_bytes);
-  u32 new_match = cmplog_count_equal_bytes(o->v0, o->v1, capped_bytes);
-  u32 ref_match = old_match;
-
-  if (*best_match_valid && *best_match > ref_match) ref_match = *best_match;
-  if (!*best_match_valid || new_match > *best_match) {
-    *best_match = new_match;
-    *best_match_valid = 1;
-  }
-
-  if (new_match > ref_match) {
-    return cmplog_compress_gain((u64)(new_match - ref_match));
-  }
-
-  return 0.0;
-
-}
-
-typedef struct {
-
-  u64    win_id;
-  double best_emitted;
-  u8     emitted;
-
-} cmplog_emit_state_t;
-
-static cmplog_emit_state_t cmplog_emit_state[CMP_MAP_W * 2U];
-
-static inline void cmplog_emit_progress_if_allowed(afl_state_t *afl, u32 key,
-                                                   u8 is_rtn,
-                                                   double progress_delta) {
-
-  if (!afl || !afl->bandit.enabled || !afl->bandit.cmp_reward) return;
-  u8 producer_mode = afl->bandit.cmp_producer_mode;
-  if (producer_mode > 2) producer_mode = 2;
-  if (!producer_mode) return;
-  if (!isfinite(progress_delta) || progress_delta <= 0.0) return;
-
-  double min_gain = afl->bandit.cmp_min_gain;
-  if (!isfinite(min_gain) || min_gain < 0.0) min_gain = 0.25;
-  /* Small deltas are often jitter; require a minimum positive gain. */
-  if (progress_delta + 1e-12 < min_gain) return;
-
-  if (afl->bandit.cmp_one_shot_site) {
-    u32 slot = key + (is_rtn ? CMP_MAP_W : 0U);
-    if (slot < CMP_MAP_W * 2U) {
-      cmplog_emit_state_t *st = &cmplog_emit_state[slot];
-      u64                  win_id = afl->bandit.total_selections;
-      if (st->win_id != win_id) {
-        st->win_id = win_id;
-        st->best_emitted = 0.0;
-        st->emitted = 0;
-      }
-
-      if (st->emitted) {
-        double prev_best = st->best_emitted;
-        if (!isfinite(prev_best) || prev_best < 0.0) prev_best = 0.0;
-        /* One-shot mode: same site emits again only when clearly better. */
-        if (progress_delta <= prev_best + min_gain) return;
-      }
-
-      st->emitted = 1;
-      if (progress_delta > st->best_emitted || !isfinite(st->best_emitted)) {
-        st->best_emitted = progress_delta;
-      }
-    }
-  }
-
-  bandit_on_cmplog_progress(&afl->bandit, progress_delta);
-
-}
 
 static struct range *add_range(struct range *ranges, u32 start, u32 end) {
 
@@ -1093,42 +936,56 @@ static u8 cmp_extend_encoding(afl_state_t *afl, struct cmp_header *h,
       u8     tmp_buf[32];
       size_t num_len = snprintf(tmp_buf, sizeof(tmp_buf), "%lld", repl);
       size_t old_len = endptr - buf_8;
+      u32    new_len = len - old_len + num_len;
 
-      u8 *new_buf = afl_realloc((void **)&afl->out_scratch_buf, len + num_len);
+      u8 *new_buf =
+          afl_realloc((void **)&afl->out_scratch_buf, (size_t)new_len);
       if (unlikely(!new_buf)) { PFATAL("alloc"); }
 
       memcpy(new_buf, buf, idx);
       memcpy(new_buf + idx, tmp_buf, num_len);
       memcpy(new_buf + idx + num_len, buf_8 + old_len, len - idx - old_len);
 
-      if (new_buf[idx + num_len] >= '0' && new_buf[idx + num_len] <= '9') {
+      if (idx + num_len < new_len && new_buf[idx + num_len] >= '0' &&
+          new_buf[idx + num_len] <= '9') {
 
         new_buf[idx + num_len] = ' ';
 
       }
 
-      if (unlikely(its_fuzz(afl, new_buf, len, status))) { return 1; }
+      if (unlikely(its_fuzz(afl, new_buf, new_len, status))) { return 1; }
+
+#ifdef CMPLOG_COMBINE
+      if (*status == 1) { cmplog_sync_combine_buf(afl, new_buf, new_len); }
+#endif
 
     } else if (use_unum && (unum == pattern || !unum)) {
 
       u8     tmp_buf[32];
       size_t num_len = snprintf(tmp_buf, sizeof(tmp_buf), "%llu", repl);
       size_t old_len = endptr - buf_8;
+      u32    new_len = len - old_len + num_len;
 
-      u8 *new_buf = afl_realloc((void **)&afl->out_scratch_buf, len + num_len);
+      u8 *new_buf =
+          afl_realloc((void **)&afl->out_scratch_buf, (size_t)new_len);
       if (unlikely(!new_buf)) { PFATAL("alloc"); }
 
       memcpy(new_buf, buf, idx);
       memcpy(new_buf + idx, tmp_buf, num_len);
       memcpy(new_buf + idx + num_len, buf_8 + old_len, len - idx - old_len);
 
-      if (new_buf[idx + num_len] >= '0' && new_buf[idx + num_len] <= '9') {
+      if (idx + num_len < new_len && new_buf[idx + num_len] >= '0' &&
+          new_buf[idx + num_len] <= '9') {
 
         new_buf[idx + num_len] = ' ';
 
       }
 
-      if (unlikely(its_fuzz(afl, new_buf, len, status))) { return 1; }
+      if (unlikely(its_fuzz(afl, new_buf, new_len, status))) { return 1; }
+
+#ifdef CMPLOG_COMBINE
+      if (*status == 1) { cmplog_sync_combine_buf(afl, new_buf, new_len); }
+#endif
 
     }
 
@@ -1380,7 +1237,9 @@ static u8 cmp_extend_encoding(afl_state_t *afl, struct cmp_header *h,
         *buf_64 = repl;
         if (unlikely(its_fuzz(afl, buf, len, status))) { return 1; }
 #ifdef CMPLOG_COMBINE
-        if (*status == 1) { memcpy(cbuf + idx, buf_64, 8); }
+        if (*status == 1 && cmplog_combine_buf && cmplog_combine_len == len) {
+          memcpy(cmplog_combine_buf + idx, buf_64, 8);
+        }
 #endif
         *buf_64 = tmp_64;
 
@@ -1421,7 +1280,9 @@ static u8 cmp_extend_encoding(afl_state_t *afl, struct cmp_header *h,
         *buf_32 = (u32)repl;
         if (unlikely(its_fuzz(afl, buf, len, status))) { return 1; }
 #ifdef CMPLOG_COMBINE
-        if (*status == 1) { memcpy(cbuf + idx, buf_32, 4); }
+        if (*status == 1 && cmplog_combine_buf && cmplog_combine_len == len) {
+          memcpy(cmplog_combine_buf + idx, buf_32, 4);
+        }
 #endif
         *buf_32 = tmp_32;
 
@@ -1455,7 +1316,9 @@ static u8 cmp_extend_encoding(afl_state_t *afl, struct cmp_header *h,
         *buf_16 = (u16)repl;
         if (unlikely(its_fuzz(afl, buf, len, status))) { return 1; }
 #ifdef CMPLOG_COMBINE
-        if (*status == 1) { memcpy(cbuf + idx, buf_16, 2); }
+        if (*status == 1 && cmplog_combine_buf && cmplog_combine_len == len) {
+          memcpy(cmplog_combine_buf + idx, buf_16, 2);
+        }
 #endif
         *buf_16 = tmp_16;
 
@@ -1494,7 +1357,9 @@ static u8 cmp_extend_encoding(afl_state_t *afl, struct cmp_header *h,
         *buf_8 = (u8)repl;
         if (unlikely(its_fuzz(afl, buf, len, status))) { return 1; }
 #ifdef CMPLOG_COMBINE
-        if (*status == 1) { cbuf[idx] = *buf_8; }
+        if (*status == 1 && cmplog_combine_buf && cmplog_combine_len == len) {
+          cmplog_combine_buf[idx] = *buf_8;
+        }
 #endif
         *buf_8 = tmp_8;
 
@@ -1601,7 +1466,10 @@ static u8 cmp_extend_encoding(afl_state_t *afl, struct cmp_header *h,
 
           if (unlikely(its_fuzz(afl, buf, len, status))) { return 1; }
   #ifdef CMPLOG_COMBINE
-          if (*status == 1) { memcpy(cbuf + idx, (char *)&new_vall, ilen); }
+          if (*status == 1 && cmplog_combine_buf &&
+              cmplog_combine_len == len) {
+            memcpy(cmplog_combine_buf + idx, (char *)&new_vall, ilen);
+          }
   #endif
           memcpy(buf + idx, tmpbuf, ilen);
 
@@ -1625,7 +1493,9 @@ static u8 cmp_extend_encoding(afl_state_t *afl, struct cmp_header *h,
 
         if (unlikely(its_fuzz(afl, buf, len, status))) { return 1; }
 #ifdef CMPLOG_COMBINE
-        if (*status == 1) { memcpy(cbuf + idx, (char *)&new_val, ilen); }
+        if (*status == 1 && cmplog_combine_buf && cmplog_combine_len == len) {
+          memcpy(cmplog_combine_buf + idx, (char *)&new_val, ilen);
+        }
 #endif
         memcpy(buf + idx, tmpbuf, ilen);
 
@@ -1875,7 +1745,9 @@ static u8 cmp_extend_encodingN(afl_state_t *afl, struct cmp_header *h,
       if (unlikely(its_fuzz(afl, buf, len, status))) { return 1; }
 
   #ifdef CMPLOG_COMBINE
-      if (*status == 1) { memcpy(cbuf + idx, r, hshape); }
+      if (*status == 1 && cmplog_combine_buf && cmplog_combine_len == len) {
+        memcpy(cmplog_combine_buf + idx, r, hshape);
+      }
   #endif
 
       memcpy(ptr, backup, hshape);
@@ -1963,9 +1835,11 @@ static u8 cmp_extend_encodingN(afl_state_t *afl, struct cmp_header *h,
         memcpy(buf + idx, (char *)&new_val, ilen);
 
         if (unlikely(its_fuzz(afl, buf, len, status))) { return 1; }
-  #ifdef CMPLOG_COMBINE
-        if (*status == 1) { memcpy(cbuf + idx, (char *)&new_val, ilen); }
-  #endif
+#ifdef CMPLOG_COMBINE
+        if (*status == 1 && cmplog_combine_buf && cmplog_combine_len == len) {
+          memcpy(cmplog_combine_buf + idx, (char *)&new_val, ilen);
+        }
+#endif
         memcpy(buf + idx, tmpbuf, ilen);
 
       };
@@ -2082,14 +1956,6 @@ static u8 cmp_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
   u32                i, j, idx, taint_len, loggeds;
   u32                have_taint = 1;
   u8                 status = 0, found_one = 0;
-  u8                 producer_mode = afl->bandit.cmp_producer_mode;
-  if (producer_mode > 2) producer_mode = 2;
-  u8                 bandit_cmplog_progress =
-      afl->bandit.enabled && afl->bandit.cmp_reward && producer_mode != 0;
-  u64                best_dist = 0;
-  u8                 best_dist_valid = 0;
-  u32                best_match = 0;
-  u8                 best_match_valid = 0;
 
   /* loop cmps are useless, detect and ignore them */
 #ifdef WORD_SIZE_64
@@ -2185,12 +2051,9 @@ static u8 cmp_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
             orig_o->v0, o->v0, orig_o->v1, o->v1, h->attribute, hshape);
 #endif
 
-    if (unlikely(bandit_cmplog_progress)) {
-      double progress_delta = cmplog_progress_from_ins_observation(
-          h, orig_o, o, &best_dist, &best_dist_valid, &best_match,
-          &best_match_valid, producer_mode);
-      cmplog_emit_progress_if_allowed(afl, key, 0, progress_delta);
-    }
+    /* Disabled Redqueen pre-mutation CmpLog reward emission.
+       Real CmpLog reward is emitted only after the actual cmplog child
+       finished and cmp_map was finalized. */
 
     t = taint;
     while (t->next) {
@@ -2411,9 +2274,7 @@ static u8 rtn_extend_encoding(afl_state_t *afl, u8 entry,
                               u32 taint_len, u8 *orig_buf, u8 *buf, u8 *cbuf,
                               u32 len, u8 lvl, u8 *status) {
 
-#ifndef CMPLOG_COMBINE
   (void)(cbuf);
-#endif
   // #ifndef CMPLOG_SOLVE_TRANSFORM
   //   (void)(changed_val);
   // #endif
@@ -2551,7 +2412,9 @@ static u8 rtn_extend_encoding(afl_state_t *afl, u8 entry,
         if (unlikely(its_fuzz(afl, buf, len, status))) { return 1; }
 
 #ifdef CMPLOG_COMBINE
-        if (*status == 1) { memcpy(cbuf + idx, &buf[idx], i); }
+        if (*status == 1 && cmplog_combine_buf && cmplog_combine_len == len) {
+          memcpy(cmplog_combine_buf + idx, &buf[idx], i + 1);
+        }
 #endif
 
       }
@@ -2909,7 +2772,9 @@ static u8 rtn_extend_encoding(afl_state_t *afl, u8 entry,
       }
 
 #ifdef CMPLOG_COMBINE
-      if (*status == 1) { memcpy(cbuf + idx, &buf[idx], i + 1); }
+      if (*status == 1 && cmplog_combine_buf && cmplog_combine_len == len) {
+        memcpy(cmplog_combine_buf + idx, &buf[idx], i + 1);
+      }
 #endif
 
       if ((i >= 7 &&
@@ -2940,12 +2805,6 @@ static u8 rtn_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
   struct cmp_header *h = &afl->shm.cmp_map->headers[key];
   u32                i, idx, have_taint = 1, taint_len, loggeds;
   u8                 status = 0, found_one = 0;
-  u8                 producer_mode = afl->bandit.cmp_producer_mode;
-  if (producer_mode > 2) producer_mode = 2;
-  u8                 bandit_cmplog_progress =
-      afl->bandit.enabled && afl->bandit.cmp_reward && producer_mode != 0;
-  u32                best_match = 0;
-  u8                 best_match_valid = 0;
 
   hshape = SHAPE_BYTES(h->shape);
 
@@ -3016,11 +2875,9 @@ static u8 rtn_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
 
 #endif
 
-    if (unlikely(bandit_cmplog_progress)) {
-      double progress_delta = cmplog_progress_from_rtn_observation(
-          orig_o, o, hshape, &best_match, &best_match_valid);
-      cmplog_emit_progress_if_allowed(afl, key, 1, progress_delta);
-    }
+    /* Disabled Redqueen pre-mutation CmpLog reward emission.
+       Real CmpLog reward is emitted only after the actual cmplog child
+       finished and cmp_map was finalized. */
 
     t = taint;
     while (t->next) {
@@ -3270,6 +3127,8 @@ u8 input_to_state_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
   // Generate the cmplog data
 
+  cmplog_reset_runtime_progress();
+
   // manually clear the full cmp_map
   memset(afl->shm.cmp_map, 0, sizeof(struct cmp_map));
   if (unlikely(common_fuzz_cmplog_stuff(afl, orig_buf, len))) {
@@ -3337,8 +3196,15 @@ u8 input_to_state_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
             (afl->cmplog_lvl == CMPLOG_LVL_MAX ? LVL3 : 0);
 
 #ifdef CMPLOG_COMBINE
-  u8 *cbuf = afl_realloc((void **)&afl->in_scratch_buf, len + 128);
-  memcpy(cbuf, orig_buf, len);
+  cmplog_combine_cap = len + 128;
+  if (cmplog_combine_cap < len) { cmplog_combine_cap = len; }
+  if (!cmplog_combine_cap) { cmplog_combine_cap = 64; }
+  cmplog_combine_buf =
+      afl_realloc((void **)&afl->in_scratch_buf, cmplog_combine_cap);
+  if (unlikely(!cmplog_combine_buf)) { PFATAL("alloc"); }
+  memcpy(cmplog_combine_buf, orig_buf, len);
+  cmplog_combine_len = len;
+  u8 *cbuf = cmplog_combine_buf;
   u8 *virgin_backup = afl_realloc((void **)&afl->ex_buf, afl->shm.map_size);
   memcpy(virgin_backup, afl->virgin_bits, afl->shm.map_size);
 #else
@@ -3447,7 +3313,7 @@ exit_its:
 
   }*/
 
-#ifdef CMPLOG_COMBINE
+  #ifdef CMPLOG_COMBINE
   if (afl->queued_items + afl->saved_crashes > orig_hit_cnt + 1) {
 
     // copy the current virgin bits so we can recover the information
@@ -3457,33 +3323,21 @@ exit_its:
     memcpy(afl->virgin_bits, virgin_backup, afl->shm.map_size);
 
     u8 status = 0;
-    its_fuzz(afl, cbuf, len, &status);
+    cbuf = cmplog_combine_buf;
+    its_fuzz(afl, cbuf, cmplog_combine_len, &status);
 
   // now combine with the saved virgin bits
-  #ifdef WORD_SIZE_64
-    u64 *v = (u64 *)afl->virgin_bits;
-    u64 *s = (u64 *)virgin_save;
-    u32  i;
-    for (i = 0; i < (afl->shm.map_size >> 3); i++) {
+    u8 *v = (u8 *)afl->virgin_bits;
+    u8 *s = (u8 *)virgin_save;
+    u32 i;
+    for (i = 0; i < afl->shm.map_size; i++) {
 
       v[i] &= s[i];
 
     }
-
-  #else
-    u32 *v = (u32 *)afl->virgin_bits;
-    u32 *s = (u32 *)virgin_save;
-    u32  i;
-    for (i = 0; i < (afl->shm.map_size >> 2); i++) {
-
-      v[i] &= s[i];
-
-    }
-
-  #endif
 
   #ifdef _DEBUG
-    dump("COMB", cbuf, len);
+    dump("COMB", cbuf, cmplog_combine_len);
     if (status == 1) {
 
       fprintf(stderr, "NEW CMPLOG_COMBINED\n");
