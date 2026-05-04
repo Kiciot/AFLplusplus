@@ -3349,6 +3349,8 @@ void bandit_log_window(afl_state_t *afl) {
   if (!afl || !afl->bandit.enabled) return;
   if (!afl->is_main_node) return;
 
+  adarare_write_config_snapshot(afl);
+
   bandit_state_t *b = &afl->bandit;
   const char *log_path = b->log_path && b->log_path[0]
                              ? (const char *)b->log_path
