@@ -207,9 +207,6 @@
 #ifndef ADARARE_DWELL_EMERGENCY_ZP_STREAK
 #define ADARARE_DWELL_EMERGENCY_ZP_STREAK 3U
 #endif
-#define ADARARE_WINDOW_MS_EARLY 4500ULL
-#define ADARARE_WINDOW_MS_LATE 8000ULL
-#define ADARARE_WINDOW_EARLY_ROUNDS 40U
 #define ADARARE_ZP_STREAK_START 3
 #define ADARARE_ZP_STEP 0.05
 #define ADARARE_ZP_FACTOR_MIN 0.80
@@ -546,11 +543,6 @@ static inline u64 bandit_current_window_ms(const bandit_state_t *bandit) {
   if (!bandit) return AFL_BANDIT_DEFAULT_WINDOW_MS;
 
   u64 cur = bandit->window_ms ? bandit->window_ms : AFL_BANDIT_DEFAULT_WINDOW_MS;
-  if (bandit->total_selections < ADARARE_WINDOW_EARLY_ROUNDS) {
-    cur = ADARARE_WINDOW_MS_EARLY;
-  } else {
-    cur = ADARARE_WINDOW_MS_LATE;
-  }
   if (cur < 100ULL) { cur = 100ULL; }
   return cur;
 }

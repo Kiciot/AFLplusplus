@@ -68,16 +68,22 @@ Configuration is handled via environment variables.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `AFL_ADARARE_WINDOW_MS` | 1000 | Duration of one decision window (ms). |
-| `AFL_ADARARE_ALPHA` | 0.5 | LinUCB exploration parameter. Higher = more exploration. |
-| `AFL_ADARARE_RIDGE` | 0.1 | Ridge regression lambda (regularization). |
-| `AFL_ADARARE_REVISIT_MS` | 1800000 | Time (ms) before forcing an arm revisit (30 mins). |
-| `AFL_ADARARE_MIX_P` | 0.5 | Probability split for Arm 6 (0.0 - 1.0). |
-| `AFL_ADARARE_GATE_MULT` | 0.05 | Strength of the Gate Amplification bonus. |
-| `AFL_ADARARE_REWARD_ALPHA` | 0.6 | Weight for Edge coverage reward. |
-| `AFL_ADARARE_REWARD_BETA` | 0.3 | Weight for Rarity mass reward. |
-| `AFL_ADARARE_REWARD_GAMMA` | 0.1 | Weight for Throughput penalty. |
+| `AFL_BANDIT` | unset | Set to `1` to enable the AdaRare/Bandit scheduler. |
+| `AFL_BANDIT_WINDOW_MS` | 5000 | Duration of one decision window (ms). |
+| `AFL_BANDIT_REWARD` | `novelty` | Reward source. Use `rarity_mass` for rarity-mass experiments. |
+| `AFL_BANDIT_REWARD_FORMULA` | `rate_cost` | Reward formula. Supported values are `rate` and `rate_cost`. |
+| `AFL_ADARARE_ALPHA` | 0.6 | LinUCB exploration parameter. Higher = more exploration. |
+| `AFL_ADARARE_RIDGE` | 10.0 | Ridge regression lambda (regularization). Values below 1.0 are clamped. |
+| `AFL_ADARARE_REVISIT_MS` | 180000 | Time (ms) before forcing an arm revisit (3 mins). |
+| `AFL_ADARARE_MIX_P` | 0.5 | Initial Arm 6 portfolio mix probability, clamped to 0.15-0.85. |
+| `AFL_ADARARE_GATE_MULT` | 0.02 | Strength of the Gate Amplification bonus. |
+| `AFL_ADARARE_GATE_CAP` | 1.15 | Maximum gate amplification factor. |
+| `AFL_ADARARE_REWARD_ALPHA` | 0.75 | Weight for Edge coverage reward. |
+| `AFL_ADARARE_REWARD_BETA` | 0.20 | Weight for Rarity mass reward. |
+| `AFL_ADARARE_REWARD_GAMMA` | 0.05 | Weight for Throughput penalty. |
 | `AFL_ADARARE_DICT_ENABLE` | 1 | Enable dynamic dictionary probability control. |
+| `AFL_ADARARE_DICT_BASELINE_PROB` | 100 | Dictionary probability before arm-specific control. |
+| `AFL_ADARARE_WARMUP_PULLS` | 2.0 | Warmup pulls required per arm. |
 | `AFL_ADARARE_VERIFY` | 0 | Enable verbose audit logging (`.adarare_verify.log`). |
 
 ## Observability
@@ -107,7 +113,8 @@ To verify the bandit is active, run AFL++ and check for the existence of the CSV
 
 ```bash
 # Example Run
-AFL_ADARARE_WINDOW_MS=500 ./afl-fuzz -i in -o out -- ./target @@
+AFL_BANDIT=1 AFL_BANDIT_WINDOW_MS=5000 AFL_BANDIT_REWARD=rarity_mass \
+  AFL_BANDIT_REWARD_FORMULA=rate_cost ./afl-fuzz -i in -o out -- ./target @@
 
 # Verify
 tail -f out/default/.adarare_bandit.csv
