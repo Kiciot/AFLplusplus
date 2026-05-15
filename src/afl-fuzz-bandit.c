@@ -144,6 +144,10 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <limits.h>
+#include <time.h>
+#ifndef __HAIKU__
+  #include <sys/resource.h>
+#endif
 
 /* --- Constants & Config --- */
 
@@ -308,8 +312,13 @@
 #ifndef ADARARE_BUILD_ID
 #define ADARARE_BUILD_ID "unknown"
 #endif
+#ifndef ADARARE_GIT_COMMIT
+#define ADARARE_GIT_COMMIT "unknown"
+#endif
 static const char adarare_build_id_anchor[] __attribute__((used)) =
     "adarare-build:" ADARARE_BUILD_ID;
+static const char adarare_git_commit_anchor[] __attribute__((used)) =
+    "adarare-git:" ADARARE_GIT_COMMIT;
 
 /* --- Helper Structures --- */
 
@@ -323,6 +332,68 @@ static inline const char *adarare_build_id_effective(void) {
   const char *env_build_id = getenv("AFL_ADARARE_BUILD_ID");
   return (env_build_id && env_build_id[0]) ? env_build_id : ADARARE_BUILD_ID;
 }
+
+static inline const char *adarare_git_commit_effective(const afl_state_t *afl) {
+
+  if (ADARARE_GIT_COMMIT[0] && strcmp(ADARARE_GIT_COMMIT, "unknown")) {
+    return ADARARE_GIT_COMMIT;
+  }
+
+  if (afl && afl->build_id[0]) { return (const char *)afl->build_id; }
+  return "unknown";
+
+}
+
+static inline uint64_t adarare_now_us(void) {
+
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) { return 0; }
+  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+
+}
+
+static inline u64 adarare_elapsed_us(uint64_t start_us, uint64_t end_us) {
+
+  if (!start_us || !end_us || end_us < start_us) { return 0; }
+  return (u64)(end_us - start_us);
+
+}
+
+static s64 adarare_file_size(const char *path) {
+
+  if (!path || !path[0]) { return -1; }
+
+  struct stat st;
+  if (stat(path, &st) != 0) { return errno == ENOENT ? 0 : -1; }
+  if (st.st_size < 0) { return -1; }
+  return (s64)st.st_size;
+
+}
+
+static s64 adarare_max_rss_mb(void) {
+
+#ifdef __HAIKU__
+  return -1;
+#else
+  struct rusage rus;
+  if (getrusage(RUSAGE_SELF, &rus) != 0) { return -1; }
+
+  #ifdef __APPLE__
+  return (s64)((rus.ru_maxrss + (1024 * 1024 - 1)) / (1024 * 1024));
+  #else
+  return (s64)((rus.ru_maxrss + 1023) / 1024);
+  #endif
+#endif
+
+}
+
+static void adarare_log_overhead_window(
+    afl_state_t *afl, u64 window_id, u32 selected_arm, u32 effective_arm,
+    u64 cur_window_ms, u64 window_elapsed_ms, u64 context_build_us,
+    u64 reward_build_us, u64 linucb_score_us, u64 model_update_us,
+    u64 profile_apply_us, u64 controller_compute_us, u64 log_write_us,
+    u64 total_window_boundary_us, s64 total_execs, double execs_per_sec,
+    s64 rss_mb, s64 log_bytes_written);
 
 typedef struct {
     double samples[BANDIT_SCORE_SAMPLE_N];
@@ -1259,6 +1330,8 @@ void bandit_deinit(bandit_state_t *bandit) {
   
   if (bandit->log_fp) { fclose(bandit->log_fp); }
   if (bandit->log_path) { ck_free(bandit->log_path); }
+  if (bandit->overhead_fp) { fclose(bandit->overhead_fp); }
+  if (bandit->overhead_path) { ck_free(bandit->overhead_path); }
   if (bandit->verify_fp) { fclose(bandit->verify_fp); }
   if (bandit->verify_log_path) { ck_free(bandit->verify_log_path); }
   if (bandit->score_res) ck_free(bandit->score_res);
@@ -1481,7 +1554,10 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->thrpt_ref_inited = 0;
   bandit->log_fp = NULL;
   bandit->log_path = NULL;
+  bandit->overhead_fp = NULL;
+  bandit->overhead_path = NULL;
   bandit->log_header_written = 0;
+  bandit->overhead_header_written = 0;
   bandit->config_written = 0;
   bandit->last_dict_prob = bandit_current_dict_prob(bandit);
   
@@ -1782,6 +1858,19 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   u64 cur_window_ms = bandit_current_window_ms(bandit);
   bandit->last_cur_window_ms = cur_window_ms;
   if (entry_now_ms - bandit->win_start_time < cur_window_ms) { return 0; }
+
+  uint64_t boundary_start_us = adarare_now_us();
+  u64 context_build_us = 0;
+  u64 reward_build_us = 0;
+  u64 linucb_score_us = 0;
+  u64 model_update_us = 0;
+  u64 profile_apply_us = 0;
+  u64 log_write_us = 0;
+  s64 log_bytes_written = -1;
+  u64 window_elapsed_ms =
+      (entry_now_ms >= bandit->win_start_time)
+          ? (entry_now_ms - bandit->win_start_time)
+          : 0;
   
   u32 prev_arm_idx = bandit->current_arm;
 
@@ -1800,6 +1889,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   
   bandit->in_warmup = bandit_in_pulls_warmup(bandit);
   bandit->last_warmup_min_pulls = bandit_min_warmup_pulls(bandit);
+
+  uint64_t reward_timer_start_us = adarare_now_us();
 
   /* ============================================================ */
   /* 1. Time & Rate Calculation                                   */
@@ -2223,6 +2314,9 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_edges_term = edges_term;
   bandit->last_rarity_term = rarity_term;
 
+  reward_build_us +=
+      adarare_elapsed_us(reward_timer_start_us, adarare_now_us());
+
   u32 progress_arm = window_arm_eff;
   if (progress_arm >= bandit->num_arms) {
     progress_arm = bandit->current_arm;
@@ -2247,6 +2341,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   /* ============================================================ */
   /* 4. Update Stats & Snapshot                                   */
   /* ============================================================ */
+
+  uint64_t model_timer_start_us = adarare_now_us();
 
   if (bandit->discount > 0.0 && bandit->discount < 1.0) {
     for (u32 i = 0; i < bandit->num_arms; ++i) {
@@ -2496,6 +2592,9 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
       reservoir_reset((bandit_reservoir_t*)bandit->score_res);
   }
 
+  model_update_us +=
+      adarare_elapsed_us(model_timer_start_us, adarare_now_us());
+
   /* ============================================================ */
   /* 5. Selection (Warmup + Stagnation-aware UCB/Revisit)         */
   /* ============================================================ */
@@ -2503,6 +2602,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   u32 next_arm = bandit->current_arm;
   bandit_build_a6_topk(bandit);
   
+  uint64_t context_timer_start_us = adarare_now_us();
+
   double raw_x[BANDIT_CTX_DIM];
   double x[BANDIT_CTX_DIM];
   double vc = (double)bandit->last_win_new_bits / safe_time;
@@ -2553,6 +2654,11 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     }
   }
 
+  context_build_us +=
+      adarare_elapsed_us(context_timer_start_us, adarare_now_us());
+
+  uint64_t model_context_timer_start_us = adarare_now_us();
+
   if (bandit->use_contextual) {
     for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
       if (arm_weights[i] > 0.0) {
@@ -2561,6 +2667,9 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
       }
     }
   }
+
+  model_update_us +=
+      adarare_elapsed_us(model_context_timer_start_us, adarare_now_us());
 
   bandit->last_a6_eta_eff = 0.0;
   bandit->last_a6_eta_stats = 0.0;
@@ -2572,6 +2681,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_mix_p_next = bandit->mix_p;
   if (bandit->current_arm == BANDIT_ARM_A6 && window_arm_eff < bandit->num_arms &&
       window_arm_eff != bandit->current_arm) {
+
+    uint64_t model_a6_timer_start_us = adarare_now_us();
 
     bandit->last_a6_eff_arm = window_arm_eff;
     double mix_p_used = bandit->mix_p;
@@ -2678,7 +2789,12 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     if (bandit->use_contextual) {
       bandit_update_arm_model(bandit, eff_arm, x, final_reward, eta);
     }
+
+    model_update_us +=
+        adarare_elapsed_us(model_a6_timer_start_us, adarare_now_us());
   }
+
+  uint64_t linucb_timer_start_us = adarare_now_us();
 
   double score_pred_dbg[AFL_BANDIT_MAX_ARMS];
   double score_bonus_dbg[AFL_BANDIT_MAX_ARMS];
@@ -3073,6 +3189,9 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_a6_choice = (next_arm == BANDIT_ARM_A6) ? next_arm_eff_candidate : next_arm;
   bandit->a6_choice_pi = next_a6_pi;
 
+  linucb_score_us +=
+      adarare_elapsed_us(linucb_timer_start_us, adarare_now_us());
+
   bandit_dbg_log_window(
       bandit, entry_now_ms, cur_window_ms, win_total_ms, prev_arm_idx, next_arm,
       arm_weights,
@@ -3088,11 +3207,46 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
       final_reward, raw_x, x, force_revisit);
 
   if (bandit->owner) {
+    uint64_t log_timer_start_us = adarare_now_us();
+    s64 log_size_before = -1;
+    s64 log_size_after = -1;
+    s64 config_size_before = -1;
+    s64 config_size_after = -1;
+    const char *owner_out_dir =
+        (bandit->owner->out_dir && bandit->owner->out_dir[0])
+            ? (const char *)bandit->owner->out_dir
+            : ".";
+    const char *primary_log_path =
+        bandit->log_path && bandit->log_path[0]
+            ? (const char *)bandit->log_path
+            : NULL;
+    u8 primary_log_path_buf[PATH_MAX];
+    if (!primary_log_path) {
+      snprintf((char *)primary_log_path_buf, sizeof(primary_log_path_buf),
+               "%s/.adarare_bandit.csv", owner_out_dir);
+      primary_log_path = (const char *)primary_log_path_buf;
+    }
+    u8 config_path_buf[PATH_MAX];
+    snprintf((char *)config_path_buf, sizeof(config_path_buf),
+             "%s/.adarare_config.json", owner_out_dir);
+    log_size_before = adarare_file_size(primary_log_path);
+    config_size_before = adarare_file_size((const char *)config_path_buf);
     bandit->last_dict_attempts = bandit->owner->adarare_dict_attempts_win;
     bandit->last_dict_taken = bandit->owner->adarare_dict_taken_win;
     bandit->owner->adarare_dict_attempts_win = 0;
     bandit->owner->adarare_dict_taken_win = 0;
     bandit_log_window(bandit->owner);
+    log_size_after = adarare_file_size(primary_log_path);
+    config_size_after = adarare_file_size((const char *)config_path_buf);
+    if (log_size_before >= 0 && log_size_after >= log_size_before) {
+      log_bytes_written = log_size_after - log_size_before;
+    }
+    if (config_size_before >= 0 && config_size_after >= config_size_before &&
+        log_bytes_written >= 0) {
+      log_bytes_written += config_size_after - config_size_before;
+    }
+    log_write_us +=
+        adarare_elapsed_us(log_timer_start_us, adarare_now_us());
   }
 
   /* Apply Selection */
@@ -3118,7 +3272,10 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   }
 
   /* Apply arm policy for NEXT window (dict, favored bias, energy multipliers). */
+  uint64_t profile_timer_start_us = adarare_now_us();
   bandit_apply_arm_policy(bandit->owner, bandit);
+  profile_apply_us +=
+      adarare_elapsed_us(profile_timer_start_us, adarare_now_us());
 
   /* Finalize Window Reset */
   bandit->win_new_cov = 0;
@@ -3167,6 +3324,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   u32 rng_count_for_log = bandit->rng_log_idx;
 
   if (bandit->verify_enabled && bandit->verify_log_path) {
+    uint64_t verify_log_timer_start_us = adarare_now_us();
     if (!bandit->verify_fp) {
       bandit->verify_fp = fopen(bandit->verify_log_path, "a");
     }
@@ -3197,7 +3355,34 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
               (unsigned long long)bandit->linucb_score_cap_hits_win);
       fflush(bandit->verify_fp);
     }
+    log_write_us +=
+        adarare_elapsed_us(verify_log_timer_start_us, adarare_now_us());
   }
+
+  s64 total_execs = -1;
+  double execs_per_sec = -1.0;
+  if (bandit->owner) {
+    total_execs = (s64)bandit->owner->fsrv.total_execs;
+    if (isfinite(bandit->owner->stats_avg_exec) &&
+        bandit->owner->stats_avg_exec > 0.0) {
+      execs_per_sec = bandit->owner->stats_avg_exec;
+    } else if (isfinite(bandit->last_thrpt) && bandit->last_thrpt >= 0.0) {
+      execs_per_sec = bandit->last_thrpt;
+    }
+  }
+
+  u64 total_window_boundary_us =
+      adarare_elapsed_us(boundary_start_us, adarare_now_us());
+  u64 controller_compute_us =
+      (total_window_boundary_us >= log_write_us)
+          ? (total_window_boundary_us - log_write_us)
+          : 0;
+  adarare_log_overhead_window(
+      bandit->owner, win_id, next_arm, bandit->current_arm_eff, cur_window_ms,
+      window_elapsed_ms, context_build_us, reward_build_us, linucb_score_us,
+      model_update_us, profile_apply_us, controller_compute_us, log_write_us,
+      total_window_boundary_us, total_execs, execs_per_sec,
+      adarare_max_rss_mb(), log_bytes_written);
 
   bandit->rng_log_idx = 0;
 
@@ -3333,8 +3518,13 @@ void bandit_set_log_dir(bandit_state_t *bandit, const char *out_dir) {
     ck_free(bandit->log_path);
     bandit->log_path = NULL;
   }
+  if (bandit->overhead_path) {
+    ck_free(bandit->overhead_path);
+    bandit->overhead_path = NULL;
+  }
   const char *dir = (out_dir && out_dir[0]) ? out_dir : ".";
   bandit->log_path = alloc_printf("%s/.adarare_bandit.csv", dir);
+  bandit->overhead_path = alloc_printf("%s/.adarare_overhead.csv", dir);
 }
 
 void bandit_log_window(afl_state_t *afl) {
@@ -3495,6 +3685,80 @@ void bandit_log_window(afl_state_t *afl) {
   fflush(b->log_fp);
 }
 
+static void adarare_log_overhead_window(
+    afl_state_t *afl, u64 window_id, u32 selected_arm, u32 effective_arm,
+    u64 cur_window_ms, u64 window_elapsed_ms, u64 context_build_us,
+    u64 reward_build_us, u64 linucb_score_us, u64 model_update_us,
+    u64 profile_apply_us, u64 controller_compute_us, u64 log_write_us,
+    u64 total_window_boundary_us, s64 total_execs, double execs_per_sec,
+    s64 rss_mb, s64 log_bytes_written) {
+
+  if (!afl || !afl->is_main_node) { return; }
+
+  bandit_state_t *b = &afl->bandit;
+  const char *overhead_path = b->overhead_path && b->overhead_path[0]
+                                  ? (const char *)b->overhead_path
+                                  : NULL;
+  u8 path[PATH_MAX];
+  if (!overhead_path) {
+    const char *out_dir =
+        (afl->out_dir && afl->out_dir[0]) ? (const char *)afl->out_dir : ".";
+    snprintf((char *)path, sizeof(path), "%s/.adarare_overhead.csv", out_dir);
+    overhead_path = (const char *)path;
+  }
+
+  if (!b->overhead_fp) {
+    b->overhead_fp = fopen(overhead_path, "a+");
+    if (!b->overhead_fp) { return; }
+    struct stat st;
+    if (fstat(fileno(b->overhead_fp), &st) == 0 && st.st_size > 0) {
+      b->overhead_header_written = 1;
+    }
+  }
+
+  if (!b->overhead_header_written) {
+    fprintf(b->overhead_fp,
+            "window_id,ts_us,selected_arm,effective_arm,cur_window_ms,"
+            "window_elapsed_ms,bandit_enabled,reward_formula,reward_type,"
+            "total_execs,execs_per_sec,rss_mb,log_bytes_written,"
+            "context_build_us,reward_build_us,linucb_score_us,model_update_us,"
+            "profile_apply_us,controller_compute_us,log_write_us,"
+            "total_window_boundary_us\n");
+    b->overhead_header_written = 1;
+  }
+
+  const char *reward_formula = bandit_reward_formula_label(b);
+  const char *reward_type = bandit_reward_label(b);
+  if (!reward_formula || !reward_formula[0]) { reward_formula = "-1"; }
+  if (!reward_type || !reward_type[0]) { reward_type = "-1"; }
+
+  s64 selected_out =
+      (selected_arm < b->num_arms) ? (s64)selected_arm : (s64)-1;
+  s64 effective_out =
+      (effective_arm < b->num_arms) ? (s64)effective_arm : (s64)-1;
+
+  fprintf(b->overhead_fp,
+          "%llu,%llu,%lld,%lld,%llu,%llu,%lld,%s,%s,%lld,%0.6f,%lld,%lld,"
+          "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+          (unsigned long long)window_id,
+          (unsigned long long)adarare_now_us(), (long long)selected_out,
+          (long long)effective_out, (unsigned long long)cur_window_ms,
+          (unsigned long long)window_elapsed_ms,
+          (long long)(afl ? (s64)b->enabled : (s64)-1), reward_formula,
+          reward_type, (long long)total_execs, execs_per_sec,
+          (long long)rss_mb, (long long)log_bytes_written,
+          (unsigned long long)context_build_us,
+          (unsigned long long)reward_build_us,
+          (unsigned long long)linucb_score_us,
+          (unsigned long long)model_update_us,
+          (unsigned long long)profile_apply_us,
+          (unsigned long long)controller_compute_us,
+          (unsigned long long)log_write_us,
+          (unsigned long long)total_window_boundary_us);
+  fflush(b->overhead_fp);
+
+}
+
 void adarare_write_config_snapshot(afl_state_t *afl) {
   if (!afl || !afl->out_dir || !afl->is_main_node) { return; }
 
@@ -3534,8 +3798,11 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
   }
 
   const char *log_path = b->log_path ? (const char *)b->log_path : "";
+  const char *overhead_path =
+      b->overhead_path ? (const char *)b->overhead_path : "";
   const char *build_id = afl->build_id[0] ? (const char *)afl->build_id : "unknown";
   const char *adarare_build_id = adarare_build_id_effective();
+  const char *adarare_git_commit = adarare_git_commit_effective(afl);
   const char *a6_offpolicy_mode_label =
       bandit_a6_offpolicy_mode_label((u8)b->a6_offpolicy_mode);
   u8 per_arm_w_delta_active = 0;
@@ -3608,6 +3875,7 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           "  \"tie_eps_rel\": %.6f,\n"
           "  \"score_sample_n\": %u,\n"
           "  \"p90_min_samples\": %u,\n"
+          "  \"overhead_timing_enabled\": true,\n"
           "  \"log_path\": ",
           b->last_a6_pi_eff, b->last_a6_ips_w, b->last_a6_eff_arm,
           b->last_mix_p_used, b->last_mix_p_next, b->a6_sub_progress_ema,
@@ -3623,10 +3891,16 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           BANDIT_P90_MIN_SAMPLES);
 
   json_print_escaped(fp, log_path);
+  fprintf(fp, ",\n  \"overhead_log_path\": ");
+  json_print_escaped(fp, overhead_path);
   fprintf(fp, ",\n  \"adarare_build_id\": ");
   json_print_escaped(fp, adarare_build_id);
+  fprintf(fp, ",\n  \"adarare_git_commit\": ");
+  json_print_escaped(fp, adarare_git_commit);
   fprintf(fp, ",\n  \"build_id\": ");
   json_print_escaped(fp, build_id);
+  fprintf(fp, ",\n  \"aflplusplus_base_version\": ");
+  json_print_escaped(fp, VERSION);
   fprintf(fp, ",\n  \"afl_version\": ");
   json_print_escaped(fp, VERSION);
   fprintf(fp, "\n}\n");

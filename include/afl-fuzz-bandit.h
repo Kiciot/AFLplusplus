@@ -293,7 +293,10 @@ typedef struct bandit_state {
   double last_p90_score;
   FILE  *log_fp;
   char  *log_path;
+  FILE  *overhead_fp;
+  char  *overhead_path;
   u8     log_header_written;
+  u8     overhead_header_written;
   u8     config_written;
   u32    dict_baseline_prob;
   u32    dict_enable;
