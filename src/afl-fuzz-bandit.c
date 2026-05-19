@@ -3819,6 +3819,8 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           "{\n"
           "  \"enabled\": %u,\n"
           "  \"window_ms\": %llu,\n"
+          "  \"default_window_ms\": %llu,\n"
+          "  \"effective_window_ms\": %llu,\n"
           "  \"num_arms\": %u,\n"
           "  \"arm_labels\": [\"A1\",\"A2\",\"A3\",\"A4\",\"A5\",\"A6\"],\n"
           "  \"contextual\": %u,\n"
@@ -3832,7 +3834,9 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           "  \"rarity_ema\": %.4f,\n"
           "  \"mix_p\": %.4f,\n"
           "  \"a6_offpolicy_mode\": ",
-          b->enabled, (unsigned long long)b->window_ms, b->num_arms,
+          b->enabled, (unsigned long long)b->window_ms,
+          (unsigned long long)AFL_BANDIT_DEFAULT_WINDOW_MS,
+          (unsigned long long)bandit_current_window_ms(b), b->num_arms,
           b->use_contextual, (unsigned int)getpid(), b->alpha, b->ridge_lambda, b->gate_multiplier,
           b->gate_cap, (unsigned long long)b->revisit_time_ms,
           b->rarity_decay, b->rarity_ema, b->mix_p);
