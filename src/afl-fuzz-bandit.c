@@ -1516,7 +1516,7 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->reward_c3 =
       bandit_env_double("AFL_ADARARE_REWARD_C3", 10.0, 1e-9, 1e18);
   bandit->cmp_reward =
-      bandit_env_int("AFL_ADARARE_CMP_REWARD", 1, 0, 1) ? 1 : 0;
+      bandit_env_int("AFL_ADARARE_CMP_REWARD", 0, 0, 1) ? 1 : 0;
   bandit->cmp_producer_mode =
       (u8)bandit_env_int("AFL_ADARARE_CMP_PRODUCER_MODE", 2, 0, 2);
   bandit->cmp_a3_boost =
