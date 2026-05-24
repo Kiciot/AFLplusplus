@@ -1543,7 +1543,7 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->alpha =
       bandit_env_double("AFL_ADARARE_ALPHA", 0.6, 0.0, 10.0);
   bandit->use_contextual =
-      bandit_env_int("AFL_ADARARE_CONTEXTUAL", 1, 0, 1) ? 1 : 0;
+      bandit_env_int("AFL_ADARARE_CONTEXTUAL", 0, 0, 1) ? 1 : 0;
       
   bandit->last_p90_score = 1.0;
   bandit->last_p90_n = 0;
