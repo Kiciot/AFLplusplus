@@ -165,7 +165,7 @@
 #define BANDIT_X5_SCALE (5.0 * BANDIT_LOG_SCALE_FACTOR)
 #define BANDIT_X_CAP 3.0
 
-/* Gate Bonus: 5% boost per log-unit of gate value */
+/* Gate bonus: configurable log-compressed boost, capped by gate_cap. */
 #define BANDIT_GATE_MULTIPLIER 0.02
 #define BANDIT_GATE_CAP 1.15
 #define BANDIT_PROGRESS_GATE_ENABLE 1
