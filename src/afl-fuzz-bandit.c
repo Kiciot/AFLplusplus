@@ -1062,6 +1062,133 @@ static inline u32 bandit_effective_arm(u32 arm, u8 mix_choice) {
 
 }
 
+static inline const char *bandit_profile_policy_label_enum(
+    bandit_policy_t policy) {
+
+  switch (policy) {
+    case BANDIT_POLICY_RANDOM_PROFILE: return "random_profile";
+    case BANDIT_POLICY_ROUND_ROBIN_PROFILE: return "round_robin_profile";
+    case BANDIT_POLICY_LINUCB:
+    default: return "linucb";
+  }
+
+}
+
+static inline const char *bandit_profile_policy_label(
+    const bandit_state_t *bandit) {
+
+  return bandit_profile_policy_label_enum(
+      bandit ? bandit->profile_policy : BANDIT_POLICY_LINUCB);
+
+}
+
+static inline u8 bandit_profile_policy_is_linucb(
+    const bandit_state_t *bandit) {
+
+  return (!bandit || bandit->profile_policy == BANDIT_POLICY_LINUCB) ? 1 : 0;
+
+}
+
+static inline bandit_policy_t bandit_parse_profile_policy(void) {
+
+  char *val = getenv("AFL_ADARARE_POLICY");
+  if (!val || !val[0]) { return BANDIT_POLICY_LINUCB; }
+
+  char norm[64];
+  size_t i = 0;
+  while (val[i] && i + 1 < sizeof(norm)) {
+    norm[i] = (char)tolower((unsigned char)val[i]);
+    i++;
+  }
+  norm[i] = '\0';
+
+  if (!strcmp(norm, "linucb") || !strcmp(norm, "default")) {
+    return BANDIT_POLICY_LINUCB;
+  } else if (!strcmp(norm, "random_profile") ||
+             !strcmp(norm, "random-profile") ||
+             !strcmp(norm, "randomprofile") ||
+             !strcmp(norm, "random")) {
+    return BANDIT_POLICY_RANDOM_PROFILE;
+  } else if (!strcmp(norm, "round_robin_profile") ||
+             !strcmp(norm, "round-robin-profile") ||
+             !strcmp(norm, "roundrobinprofile") ||
+             !strcmp(norm, "round_robin") ||
+             !strcmp(norm, "round-robin")) {
+    return BANDIT_POLICY_ROUND_ROBIN_PROFILE;
+  }
+
+  return BANDIT_POLICY_LINUCB;
+
+}
+
+static inline void bandit_seed_profile_policy_rng(bandit_state_t *bandit) {
+
+  if (!bandit) { return; }
+  u64 seed = bandit->rng_state ^ 0x9e3779b97f4a7c15ULL ^
+             (u64)(uintptr_t)&bandit->profile_policy_rng_state;
+  if (!seed) { seed = 0x6a09e667f3bcc909ULL; }
+  bandit->profile_policy_rng_state = seed;
+
+}
+
+static u32 bandit_get_profile_policy_random(bandit_state_t *bandit) {
+
+  if (!bandit) { return (u32)(get_cur_time_us() >> 32); }
+  if (!bandit->profile_policy_rng_state) {
+    bandit_seed_profile_policy_rng(bandit);
+  }
+  return (u32)(xorshift64(&bandit->profile_policy_rng_state) >> 32);
+
+}
+
+static inline u32 bandit_profile_arm_count(const bandit_state_t *bandit) {
+
+  if (!bandit || !bandit->num_arms) { return 0; }
+  u32 count = bandit->num_arms;
+  if (count > (u32)BANDIT_ARM_A6) { count = (u32)BANDIT_ARM_A6; }
+  return count;
+
+}
+
+static u32 bandit_select_profile_control_arm(bandit_state_t *bandit) {
+
+  u32 profile_arms = bandit_profile_arm_count(bandit);
+  if (!profile_arms) { return BANDIT_ARM_A1; }
+
+  if (bandit->profile_policy == BANDIT_POLICY_RANDOM_PROFILE) {
+    return bandit_get_profile_policy_random(bandit) % profile_arms;
+  }
+
+  u32 cur = bandit->current_arm_eff;
+  if (cur >= profile_arms) {
+    cur = bandit_effective_arm(bandit->current_arm, bandit->mix_choice);
+  }
+  if (cur >= profile_arms) { cur = BANDIT_ARM_A1; }
+  return (cur + 1U) % profile_arms;
+
+}
+
+static void bandit_start_profile_control_arm(bandit_state_t *bandit) {
+
+  if (!bandit || bandit_profile_policy_is_linucb(bandit)) { return; }
+  if (bandit->total_selections || bandit->rotate_count) { return; }
+
+  u32 profile_arms = bandit_profile_arm_count(bandit);
+  if (!profile_arms) { return; }
+
+  u32 arm = BANDIT_ARM_A1;
+  if (bandit->profile_policy == BANDIT_POLICY_RANDOM_PROFILE) {
+    arm = bandit_get_profile_policy_random(bandit) % profile_arms;
+  }
+
+  bandit->current_arm = arm;
+  bandit->current_arm_eff = arm;
+  bandit->mix_choice = (u8)arm;
+  bandit->last_selected_arm = arm;
+  bandit->win_last_arm = arm;
+
+}
+
 static inline void bandit_win_account(bandit_state_t *bandit, u64 now_ms) {
 
   if (!bandit || !bandit->enabled) { return; }
@@ -1372,7 +1499,9 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->current_arm_eff = 0;
   bandit->dwell_windows = 0;
   bandit->last_selected_arm = 0;
+  bandit->profile_policy = bandit_parse_profile_policy();
   bandit->rng_state = 0;
+  bandit->profile_policy_rng_state = 0;
   bandit->verify_enabled =
       bandit_env_int("AFL_ADARARE_VERIFY", 0, 0, 1) ? 1 : 0;
   bandit->rng_seeded_from_owner = 0;
@@ -1564,6 +1693,7 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->rng_state =
       get_cur_time_us() ^ (u64)getpid() ^ (u64)(uintptr_t)bandit;
   if (!bandit->rng_state) bandit->rng_state = 1;
+  bandit_seed_profile_policy_rng(bandit);
   bandit->verify_log_path = NULL;
   bandit->verify_fp = NULL;
   
@@ -1619,13 +1749,13 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
             "[adarare] build_id=%s warmup_pulls=%.3f progress_gate=1 "
             "gate_headroom=1 tie_break=deterministic tie_eps_rel=%.6f "
             "cmp_reward=%u cmp_mode=%u a3_cmp_boost=%u delta=%.3f c3=%.3f "
-            "cmp_baseline_norm=%u cmp_baseline_ema=%.3f\n",
+            "cmp_baseline_norm=%u cmp_baseline_ema=%.3f policy=%s\n",
             build_id, bandit->warmup_pulls_target, ADARARE_TIE_EPS_REL,
             (unsigned int)bandit->cmp_reward,
             (unsigned int)bandit->cmp_producer_mode,
             (unsigned int)bandit->cmp_a3_boost, bandit->reward_delta,
             bandit->reward_c3, (unsigned int)bandit->cmp_baseline_norm,
-            bandit->cmp_baseline_ema);
+            bandit->cmp_baseline_ema, bandit_profile_policy_label(bandit));
     bandit_build_id_logged = 1;
   }
 #endif
@@ -1671,7 +1801,9 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
     reservoir_reset(&((bandit_reservoir_t *)bandit->cmplog_rate_res)[i]);
   }
 
-  bandit_build_a6_topk(bandit);
+  if (bandit_profile_policy_is_linucb(bandit)) {
+    bandit_build_a6_topk(bandit);
+  }
 }
 
 static void bandit_apply_arm_policy(afl_state_t *afl, bandit_state_t *bandit) {
@@ -1725,14 +1857,16 @@ void bandit_set_owner(bandit_state_t *bandit, struct afl_state *afl) {
   bandit->owner = afl;
   if (afl) {
     afl->bandit_dict_enable = bandit->dict_enable ? 1 : 0;
-    bandit_apply_arm_policy(afl, bandit);
     if (!bandit->rng_seeded_from_owner) {
       bandit->rng_state =
           ((u64)afl->rand_seed[0] << 32) ^ (u64)afl->rand_seed[1] ^
           0xAF1BABD190ULL ^ (u64)(uintptr_t)bandit;
       if (!bandit->rng_state) bandit->rng_state = 1;
+      bandit_seed_profile_policy_rng(bandit);
       bandit->rng_seeded_from_owner = 1;
     }
+    bandit_start_profile_control_arm(bandit);
+    bandit_apply_arm_policy(afl, bandit);
   }
 }
 
@@ -2600,7 +2734,10 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   /* ============================================================ */
 
   u32 next_arm = bandit->current_arm;
-  bandit_build_a6_topk(bandit);
+  u8 linucb_policy = bandit_profile_policy_is_linucb(bandit);
+  if (linucb_policy) {
+    bandit_build_a6_topk(bandit);
+  }
   
   uint64_t context_timer_start_us = adarare_now_us();
 
@@ -2679,7 +2816,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_a6_eff_arm = BANDIT_ARM_A6;
   bandit->last_mix_p_used = bandit->mix_p;
   bandit->last_mix_p_next = bandit->mix_p;
-  if (bandit->current_arm == BANDIT_ARM_A6 && window_arm_eff < bandit->num_arms &&
+  if (linucb_policy &&
+      bandit->current_arm == BANDIT_ARM_A6 && window_arm_eff < bandit->num_arms &&
       window_arm_eff != bandit->current_arm) {
 
     uint64_t model_a6_timer_start_us = adarare_now_us();
@@ -2844,7 +2982,9 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   u8 stag_bonus_boost = 0;
   bandit->last_stag_bonus_boost = 0;
 
-  if (bandit->in_warmup) {
+  if (!linucb_policy) {
+    next_arm = bandit_select_profile_control_arm(bandit);
+  } else if (bandit->in_warmup) {
     next_arm = bandit_argmin_pulls(bandit);
   } else if (stagnating &&
              (!bandit->last_revisit_ms ||
@@ -3091,7 +3231,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     }
   }
 
-  if (prev_arm_idx < bandit->num_arms) {
+  if (linucb_policy && prev_arm_idx < bandit->num_arms) {
     dwell_emergency_zero =
         (bandit->arms[prev_arm_idx].zp_streak >=
          (u32)ADARARE_DWELL_EMERGENCY_ZP_STREAK)
@@ -3099,7 +3239,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
             : 0;
   }
 
-  if (!bandit->in_warmup && !force_revisit && !bandit->stag_trend_active &&
+  if (linucb_policy &&
+      !bandit->in_warmup && !force_revisit && !bandit->stag_trend_active &&
       !dwell_emergency_zero &&
       next_arm != prev_arm_idx &&
       bandit->dwell_windows < ADARARE_MIN_DWELL_WINDOWS) {
@@ -3109,16 +3250,18 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_dwell_blocked = dwell_blocked;
   bandit->last_dwell_emergency_zero = dwell_emergency_zero;
 
-  if (next_arm < AFL_BANDIT_MAX_ARMS && !isfinite(score_total_dbg[next_arm])) {
+  if (linucb_policy && next_arm < AFL_BANDIT_MAX_ARMS &&
+      !isfinite(score_total_dbg[next_arm])) {
     score_pred_dbg[next_arm] = bandit_arm_mean_reward(&bandit->arms[next_arm]);
     score_bonus_dbg[next_arm] = 0.0;
     score_total_dbg[next_arm] = score_pred_dbg[next_arm];
   }
 
-  bandit->last_ucb_score = (next_arm < AFL_BANDIT_MAX_ARMS &&
-                            isfinite(score_total_dbg[next_arm]))
-                               ? score_total_dbg[next_arm]
-                               : 0.0;
+  bandit->last_ucb_score =
+      (linucb_policy && next_arm < AFL_BANDIT_MAX_ARMS &&
+       isfinite(score_total_dbg[next_arm]))
+          ? score_total_dbg[next_arm]
+          : 0.0;
   bandit->tie_break_hits_win = tie_break_hits;
   bandit->tie_break_det_hits_win = tie_break_det_hits;
   bandit->last_tie_break_det = tie_break_det_hits ? 1 : 0;
@@ -3152,7 +3295,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   u8 next_mix_choice = 0;
   u32 next_arm_eff_candidate = next_arm;
   double next_a6_pi = 0.0;
-  if (next_arm == BANDIT_ARM_A6) {
+  if (linucb_policy && next_arm == BANDIT_ARM_A6) {
     u32 chosen = bandit->a6_topk[0];
     double chosen_prob = bandit->a6_topk_prob[0];
     double pick = (double)bandit_get_random(bandit) / 4294967296.0;
@@ -3335,7 +3478,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
       
       fprintf(bandit->verify_fp,
               "win_id=%llu entry_now_ms=%llu new_start_ms=%llu win_actual_len=%llu "
-              "window_ms=%llu logic_shift_ms=%llu rotate_us=%llu rng_seeded_owner=%u "
+              "window_ms=%llu policy=%s logic_shift_ms=%llu rotate_us=%llu rng_seeded_owner=%u "
               "rng_state=0x%llx rng_log_n=%u arm_prev=%u arm_next=%u "
               "inv_fail_win=%llu rad_cap_win=%llu score_cap_win=%llu\n",
               (unsigned long long)win_id, /* Explicit Window ID */
@@ -3343,6 +3486,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
               (unsigned long long)bandit->win_start_time,
               (unsigned long long)win_actual_len, /* Checked Delta */
               (unsigned long long)bandit->window_ms,
+              bandit_profile_policy_label(bandit),
               (unsigned long long)logic_shift_ms, /* Checked Shift */
               (unsigned long long)bandit->last_rotate_us, /* Added rotate_us */
               bandit->rng_seeded_from_owner,
@@ -3583,7 +3727,7 @@ void bandit_log_window(afl_state_t *afl) {
             "reward_delta,scale_c3_used,p90_cmplog,cmplog_inject_count,cmplog_inject_sum,"
             "cmp_min_gain,cmp_win_clip,cmplog_inject_clipped_count,"
             "cmp_reward,cmp_producer_mode,cmp_a3_boost,cmplog_mod,cmp_rarity_lambda,"
-            "cmplog_rate_ema,cmplog_rate_norm\n");
+            "cmplog_rate_ema,cmplog_rate_norm,policy\n");
     b->log_header_written = 1;
   }
 
@@ -3679,8 +3823,8 @@ void bandit_log_window(afl_state_t *afl) {
           (unsigned int)b->cmp_a3_boost, b->last_cmplog_mod,
           b->cmp_rarity_lambda);
 
-  fprintf(b->log_fp, ",%0.6f,%0.6f\n", b->cmplog_rate_ema,
-          b->last_cmplog_rate_norm);
+  fprintf(b->log_fp, ",%0.6f,%0.6f,%s\n", b->cmplog_rate_ema,
+          b->last_cmplog_rate_norm, bandit_profile_policy_label(b));
 
   fflush(b->log_fp);
 }
@@ -3723,7 +3867,7 @@ static void adarare_log_overhead_window(
             "total_execs,execs_per_sec,rss_mb,log_bytes_written,"
             "context_build_us,reward_build_us,linucb_score_us,model_update_us,"
             "profile_apply_us,controller_compute_us,log_write_us,"
-            "total_window_boundary_us\n");
+            "total_window_boundary_us,policy\n");
     b->overhead_header_written = 1;
   }
 
@@ -3739,7 +3883,7 @@ static void adarare_log_overhead_window(
 
   fprintf(b->overhead_fp,
           "%llu,%llu,%lld,%lld,%llu,%llu,%lld,%s,%s,%lld,%0.6f,%lld,%lld,"
-          "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+          "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%s\n",
           (unsigned long long)window_id,
           (unsigned long long)adarare_now_us(), (long long)selected_out,
           (long long)effective_out, (unsigned long long)cur_window_ms,
@@ -3754,7 +3898,8 @@ static void adarare_log_overhead_window(
           (unsigned long long)profile_apply_us,
           (unsigned long long)controller_compute_us,
           (unsigned long long)log_write_us,
-          (unsigned long long)total_window_boundary_us);
+          (unsigned long long)total_window_boundary_us,
+          bandit_profile_policy_label(b));
   fflush(b->overhead_fp);
 
 }
@@ -3819,6 +3964,7 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           "{\n"
           "  \"enabled\": %u,\n"
           "  \"window_ms\": %llu,\n"
+          "  \"policy\": \"%s\",\n"
           "  \"num_arms\": %u,\n"
           "  \"arm_labels\": [\"A1\",\"A2\",\"A3\",\"A4\",\"A5\",\"A6\"],\n"
           "  \"contextual\": %u,\n"
@@ -3832,7 +3978,8 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           "  \"rarity_ema\": %.4f,\n"
           "  \"mix_p\": %.4f,\n"
           "  \"a6_offpolicy_mode\": ",
-          b->enabled, (unsigned long long)b->window_ms, b->num_arms,
+          b->enabled, (unsigned long long)b->window_ms,
+          bandit_profile_policy_label(b), b->num_arms,
           b->use_contextual, (unsigned int)getpid(), b->alpha, b->ridge_lambda, b->gate_multiplier,
           b->gate_cap, (unsigned long long)b->revisit_time_ms,
           b->rarity_decay, b->rarity_ema, b->mix_p);

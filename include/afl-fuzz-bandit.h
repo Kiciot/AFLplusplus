@@ -58,6 +58,12 @@ typedef enum {
   BANDIT_A6_OFFPOLICY_CLIPPED_IPS = 2
 } bandit_a6_offpolicy_mode_t;
 
+typedef enum {
+  BANDIT_POLICY_LINUCB = 0,
+  BANDIT_POLICY_RANDOM_PROFILE,
+  BANDIT_POLICY_ROUND_ROBIN_PROFILE
+} bandit_policy_t;
+
 typedef struct bandit_arm_state {
 
   double pulls;        /* Discounted execution weight for UCB. */
@@ -84,6 +90,8 @@ typedef struct bandit_state {
   u8 enabled;
   struct afl_state *owner;
   u64 rng_state; /* Decoupled RNG for bandit decisions */
+  bandit_policy_t profile_policy;
+  u64 profile_policy_rng_state;
   u32 num_arms;
   u32 current_arm;
   u32 current_arm_eff; /* Frozen effective arm for current window (A6 -> A1/A2). */
