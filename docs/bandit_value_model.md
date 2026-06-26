@@ -36,8 +36,9 @@ The reward quantifies how "good" a window was. It uses a **Tanh-based** formula 
 The scheduler controls fuzzing parameters via 6 distinct "Arms":
 
 * **A1 - A5**: Concrete strategies with different energy/mutation characteristics.
-* **A6 (Hierarchical Mix)**: A meta-arm. When selected, it probabilistically delegates execution to **Arm 1** or **Arm 2** based on a configured probability (`mix_p`).
-* *Off-Policy Update*: When A6 runs, the system updates the models for **both** A6 and the effective arm (A1 or A2), maximizing data efficiency.
+* **A6 (Delegated Sharing Meta-Arm)**: A meta-arm. When selected, it probabilistically delegates execution to **Arm 1** or **Arm 2** based on a configured probability (`mix_p`).
+* **Clipped delegated-sample sharing**: When A6 runs, the system updates **A6** with the selected meta-arm reward and gives the effective delegated arm (**A1** or **A2**) an additional clipped delegated-sample update scaled by the realized delegation probability.
+* **Important terminology note**: Historical internal names such as `offpolicy`, `ips`, or `clipped_ips` are compatibility aliases. The reported mechanism is **clipped delegated-sample sharing**, not a full IPS pipeline, not an unbiased off-policy estimator, and no unexecuted arm receives synthetic reward.
 
 
 
@@ -76,6 +77,8 @@ Configuration is handled via environment variables.
 | `AFL_ADARARE_RIDGE` | 10.0 | Ridge regression lambda (regularization). Values below 1.0 are clamped. |
 | `AFL_ADARARE_REVISIT_MS` | 180000 | Time (ms) before forcing an arm revisit (3 mins). |
 | `AFL_ADARARE_MIX_P` | 0.5 | Initial Arm 6 portfolio mix probability, clamped to 0.15-0.85. |
+| `AFL_ADARARE_A6_SHARING_MODE` | `clipped_delegated` | A6 sharing mode. Accepted canonical values are `fixed`, `delegated_fixed`, `inverse_prob`, `clipped_delegated`, and `clipped_delegated_sharing`. |
+| `AFL_ADARARE_A6_OFFPOLICY_MODE` | legacy alias | Historical/internal compatibility alias for `AFL_ADARARE_A6_SHARING_MODE`. Old values such as `ips`, `clipped_ips`, and `clipped-ips` still map to the delegated-sharing modes above. |
 | `AFL_ADARARE_GATE_MULT` | 0.02 | Strength of the Gate Amplification bonus. |
 | `AFL_ADARARE_GATE_CAP` | 1.15 | Maximum gate amplification factor. |
 | `AFL_ADARARE_REWARD_ALPHA` | 0.75 | Weight for Edge coverage reward. |
@@ -92,7 +95,7 @@ The scheduler produces rich telemetry in the output directory:
 
 ### 1. `.adarare_config.json`
 
-A static snapshot of the configuration parameters and build ID used for the session.
+A static snapshot of the configuration parameters and build ID used for the session. Reviewer-facing fields now use delegated-sharing terminology such as `sharing_mode`, `a6_sharing_mode`, `delegated_sharing_clip`, and `delegated_sharing_pi_eps`, while `legacy_a6_offpolicy_mode` is retained only as a compatibility label.
 
 ### 2. `.adarare_bandit.csv`
 
@@ -101,6 +104,9 @@ A real-time log updated every window. Key columns:
 * `ts_ms`: Timestamp.
 * `arm_id`: Selected arm (0-5).
 * `effective_arm`: The actual strategy run (resolves A6).
+* `a6_sharing_mode`: Canonical A6 sharing label such as `clipped_delegated`.
+* `legacy_a6_offpolicy_mode`: Historical compatibility label such as `clipped_ips`.
+* `a6_sharing_weight`: The clipped delegated-sample sharing weight applied to the effective delegated arm.
 * `reward`: The final normalized reward [0,1].
 * `p90_score`: Current P90 threshold used for scaling.
 * `edges_term`, `rarity_term`: Components of the reward.

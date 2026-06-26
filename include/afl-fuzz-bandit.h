@@ -53,10 +53,10 @@ typedef enum {
 } bandit_arm_id_t;
 
 typedef enum {
-  BANDIT_A6_OFFPOLICY_FIXED = 0,
-  BANDIT_A6_OFFPOLICY_IPS = 1,
-  BANDIT_A6_OFFPOLICY_CLIPPED_IPS = 2
-} bandit_a6_offpolicy_mode_t;
+  BANDIT_A6_SHARING_FIXED = 0,
+  BANDIT_A6_SHARING_INVERSE_PROB_LEGACY = 1,
+  BANDIT_A6_SHARING_CLIPPED_DELEGATED = 2
+} bandit_a6_sharing_mode_t;
 
 typedef enum {
   BANDIT_POLICY_LINUCB = 0,
@@ -193,7 +193,7 @@ typedef struct bandit_state {
   double rarity_decay;
   double rarity_ema;
   double mix_p;
-  bandit_a6_offpolicy_mode_t a6_offpolicy_mode;
+  bandit_a6_sharing_mode_t a6_sharing_mode;
   u32    a6_topk[AFL_BANDIT_MAX_ARMS];
   double a6_topk_prob[AFL_BANDIT_MAX_ARMS];
   u32    last_a6_choice;
@@ -270,7 +270,7 @@ typedef struct bandit_state {
   double last_a6_eta_stats;
   double last_a6_eta_model;
   double last_a6_pi_eff;
-  double last_a6_ips_w;
+  double last_a6_sharing_w;
   u32    last_a6_eff_arm;
   double last_mix_p_used;
   double last_mix_p_next;

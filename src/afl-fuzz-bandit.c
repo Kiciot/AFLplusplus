@@ -44,8 +44,15 @@
         (Mean + alpha * Radius) derived from Ridge Regression (A^-1 * b).
         - Includes safety fallbacks to UCB1 if matrix inversion fails.
         - Includes clamping for matrix values and score bounds.
-     d. Hierarchical Mixing (Arm A6): If Arm 6 is selected, it acts as a meta-arm, 
+     d. Hierarchical Mixing (Arm A6): If Arm 6 is selected, it acts as a meta-arm,
         probabilistically delegating to Arm 1 or Arm 2 based on a "Mix Probability".
+     e. A6 Delegated-Sample Sharing: When A6 delegates execution to Arm 1 or Arm 2,
+        the selected meta-arm is updated as usual and the effective delegated arm
+        receives an additional clipped delegated-sample update weighted by the
+        realized delegation probability. Historical internal names may call this
+        path "offpolicy" or "IPS" for backward compatibility, but the reported
+        mechanism is clipped delegated-sample sharing, not an unbiased IPS
+        estimator and not a full off-policy evaluator.
 
   4. Non-Stationary Handling:
      - Discounting: Applies a discount factor (gamma < 1.0) to all historical data 
@@ -114,10 +121,14 @@
         Arm 6 是一个元策略 (Meta-Arm)，它不执行特定变异，而是根据概率 (mix_p) 
         将执行权委托给 Arm 1 或 Arm 2。
 
-  4. 离策略学习 (Off-Policy Learning):
-     当 Arm 6 被选中并委托给 Arm 1/2 时，系统执行离策略更新：
-     - 同时更新 Arm 6 (Meta-Arm) 和 实际执行臂 (Effective Arm) 的模型。
-     - 这最大化了样本利用率，确保底层臂在未被直接选中时也能通过 Arm 6 获得训练数据。
+  4. A6 委托样本共享 (Delegated-Sample Sharing):
+     当 Arm 6 被选中并委托给 Arm 1/2 时，系统会：
+     - 正常更新 Arm 6 (Meta-Arm)；
+     - 再对实际执行臂 (Effective Arm) 施加一个按委托概率缩放、并经过裁剪的
+       delegated-sample 更新。
+     历史内部命名里可能仍会把这条路径写成 offpolicy 或 IPS 兼容别名，但对外报告的
+     正式机制是 clipped delegated-sample sharing；它不是无偏 IPS estimator，
+     也不会给未执行的臂注入 synthetic reward。
 
   5. 非平稳环境处理与数值稳定性 (Stability):
      - 折扣因子 (Discounting): 每个窗口对历史数据 (矩阵 A/b) 乘以衰减因子 
@@ -292,20 +303,20 @@
 #ifndef ADARARE_A6_MIX_TANH_SCALE
 #define ADARARE_A6_MIX_TANH_SCALE 0.05
 #endif
-#ifndef ADARARE_A6_OFFPOLICY_MODE_DEFAULT
-#define ADARARE_A6_OFFPOLICY_MODE_DEFAULT BANDIT_A6_OFFPOLICY_CLIPPED_IPS
+#ifndef ADARARE_A6_SHARING_MODE_DEFAULT
+#define ADARARE_A6_SHARING_MODE_DEFAULT BANDIT_A6_SHARING_CLIPPED_DELEGATED
 #endif
-#define ADARARE_ENABLE_IPS 1
-#define ADARARE_IPS_CLIP 2.0
-#define ADARARE_IPS_PI_EPS 1e-6
-#ifndef ADARARE_ENABLE_IPS_STATS
-#define ADARARE_ENABLE_IPS_STATS 1
+#define ADARARE_ENABLE_DELEGATED_SHARING 1
+#define ADARARE_DELEGATED_SHARING_CLIP 2.0
+#define ADARARE_DELEGATED_SHARING_PI_EPS 1e-6
+#ifndef ADARARE_ENABLE_DELEGATED_SHARING_STATS
+#define ADARARE_ENABLE_DELEGATED_SHARING_STATS 1
 #endif
-#ifndef ADARARE_ENABLE_IPS_MODEL
-#define ADARARE_ENABLE_IPS_MODEL 0
+#ifndef ADARARE_ENABLE_DELEGATED_SHARING_MODEL
+#define ADARARE_ENABLE_DELEGATED_SHARING_MODEL 0
 #endif
-#ifndef ADARARE_IPS_MODEL_CLIP
-#define ADARARE_IPS_MODEL_CLIP 1.0
+#ifndef ADARARE_DELEGATED_SHARING_MODEL_CLIP
+#define ADARARE_DELEGATED_SHARING_MODEL_CLIP 1.0
 #endif
 #define BANDIT_BUILD_ID_AUDIT 1
 
@@ -569,7 +580,7 @@ static const bandit_arm_cfg_t kArmCfg[AFL_BANDIT_MAX_ARMS] = {
         .zp_penalty_mul = 0.60,
     },
     [BANDIT_ARM_A6] = {
-        .name = "A6 top-k portfolio",
+        .name = "A6 delegated sharing",
         .dict_prob = 15,
         .havoc_stack_mul = 1.00,
         .prefer_favored = 0,
@@ -1291,25 +1302,33 @@ static int bandit_env_int(const char *key, int def, int minv, int maxv) {
   return (int)v;
 }
 
-static inline u8 bandit_parse_a6_offpolicy_mode(void) {
+static inline const char *bandit_get_a6_sharing_mode_env(void) {
 
-  char *val = getenv("AFL_ADARARE_A6_OFFPOLICY_MODE");
-  if (!val || !val[0]) {
-    return (u8)bandit_env_int("AFL_ADARARE_A6_OFFPOLICY_MODE",
-                              ADARARE_A6_OFFPOLICY_MODE_DEFAULT,
-                              BANDIT_A6_OFFPOLICY_FIXED,
-                              BANDIT_A6_OFFPOLICY_CLIPPED_IPS);
-  }
+  const char *val = getenv("AFL_ADARARE_A6_SHARING_MODE");
+  if (val && val[0]) { return val; }
+
+  /* Legacy/internal alias: preserved for old experiment wrappers only. */
+  return getenv("AFL_ADARARE_A6_OFFPOLICY_MODE");
+
+}
+
+static inline u8 bandit_parse_a6_sharing_mode(void) {
+
+  const char *val = bandit_get_a6_sharing_mode_env();
+  if (!val || !val[0]) { return ADARARE_A6_SHARING_MODE_DEFAULT; }
 
   if ((val[0] >= '0' && val[0] <= '9') || val[0] == '+' || val[0] == '-') {
-    int mode = bandit_env_int("AFL_ADARARE_A6_OFFPOLICY_MODE",
-                              ADARARE_A6_OFFPOLICY_MODE_DEFAULT,
-                              BANDIT_A6_OFFPOLICY_FIXED,
-                              BANDIT_A6_OFFPOLICY_CLIPPED_IPS);
+    char *end = NULL;
+    long mode = strtol(val, &end, 10);
+    if (end == val) { return ADARARE_A6_SHARING_MODE_DEFAULT; }
+    if (mode < BANDIT_A6_SHARING_FIXED) mode = BANDIT_A6_SHARING_FIXED;
+    if (mode > BANDIT_A6_SHARING_CLIPPED_DELEGATED) {
+      mode = BANDIT_A6_SHARING_CLIPPED_DELEGATED;
+    }
     return (u8)mode;
   }
 
-  char norm[32];
+  char norm[48];
   size_t i = 0;
   while (val[i] && i + 1 < sizeof(norm)) {
     norm[i] = (char)tolower((unsigned char)val[i]);
@@ -1317,25 +1336,45 @@ static inline u8 bandit_parse_a6_offpolicy_mode(void) {
   }
   norm[i] = '\0';
 
-  if (!strcmp(norm, "fixed")) {
-    return BANDIT_A6_OFFPOLICY_FIXED;
-  } else if (!strcmp(norm, "ips")) {
-    return BANDIT_A6_OFFPOLICY_IPS;
-  } else if (!strcmp(norm, "clipped") || !strcmp(norm, "clippedips") ||
-             !strcmp(norm, "clipped_ips") || !strcmp(norm, "clipped-ips")) {
-    return BANDIT_A6_OFFPOLICY_CLIPPED_IPS;
+  if (!strcmp(norm, "fixed") || !strcmp(norm, "delegated_fixed")) {
+    return BANDIT_A6_SHARING_FIXED;
+  } else if (!strcmp(norm, "inverse_prob")) {
+    return BANDIT_A6_SHARING_INVERSE_PROB_LEGACY;
+  } else if (!strcmp(norm, "clipped_delegated") ||
+             !strcmp(norm, "clipped_delegated_sharing")) {
+    return BANDIT_A6_SHARING_CLIPPED_DELEGATED;
   }
 
-  return ADARARE_A6_OFFPOLICY_MODE_DEFAULT;
+  /* Legacy parser aliases map historical IPS terms onto delegated sharing.
+     They are internal compatibility names, not paper claims of unbiased IPS. */
+  if (!strcmp(norm, "ips")) {
+    return BANDIT_A6_SHARING_INVERSE_PROB_LEGACY;
+  } else if (!strcmp(norm, "clipped") || !strcmp(norm, "clippedips") ||
+             !strcmp(norm, "clipped_ips") || !strcmp(norm, "clipped-ips")) {
+    return BANDIT_A6_SHARING_CLIPPED_DELEGATED;
+  }
+
+  return ADARARE_A6_SHARING_MODE_DEFAULT;
 
 }
 
-static inline const char *bandit_a6_offpolicy_mode_label(u8 mode) {
+static inline const char *bandit_a6_sharing_mode_label(u8 mode) {
 
-  switch ((bandit_a6_offpolicy_mode_t)mode) {
-    case BANDIT_A6_OFFPOLICY_FIXED: return "fixed";
-    case BANDIT_A6_OFFPOLICY_IPS: return "ips";
-    case BANDIT_A6_OFFPOLICY_CLIPPED_IPS: return "clipped_ips";
+  switch ((bandit_a6_sharing_mode_t)mode) {
+    case BANDIT_A6_SHARING_FIXED: return "fixed";
+    case BANDIT_A6_SHARING_INVERSE_PROB_LEGACY: return "inverse_prob";
+    case BANDIT_A6_SHARING_CLIPPED_DELEGATED: return "clipped_delegated";
+    default: return "clipped_delegated";
+  }
+
+}
+
+static inline const char *bandit_a6_sharing_mode_legacy_label(u8 mode) {
+
+  switch ((bandit_a6_sharing_mode_t)mode) {
+    case BANDIT_A6_SHARING_FIXED: return "fixed";
+    case BANDIT_A6_SHARING_INVERSE_PROB_LEGACY: return "ips";
+    case BANDIT_A6_SHARING_CLIPPED_DELEGATED: return "clipped_ips";
     default: return "clipped_ips";
   }
 
@@ -1556,7 +1595,7 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->last_a6_eta_stats = 0.0;
   bandit->last_a6_eta_model = 0.0;
   bandit->last_a6_pi_eff = 0.0;
-  bandit->last_a6_ips_w = 1.0;
+  bandit->last_a6_sharing_w = 1.0;
   bandit->last_a6_eff_arm = BANDIT_ARM_A6;
   bandit->last_mix_p_used = 0.5;
   bandit->last_mix_p_next = 0.5;
@@ -1603,7 +1642,7 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->rarity_ema =
       bandit_env_double("AFL_ADARARE_RARITY_EMA", 1.0, 0.05, 1.0);
   bandit->mix_p = bandit_env_double("AFL_ADARARE_MIX_P", 0.5, 0.0, 1.0);
-  bandit->a6_offpolicy_mode = (bandit_a6_offpolicy_mode_t)bandit_parse_a6_offpolicy_mode();
+  bandit->a6_sharing_mode = (bandit_a6_sharing_mode_t)bandit_parse_a6_sharing_mode();
   if (bandit->mix_p < ADARARE_MIX_P_MIN) bandit->mix_p = ADARARE_MIX_P_MIN;
   if (bandit->mix_p > ADARARE_MIX_P_MAX) bandit->mix_p = ADARARE_MIX_P_MAX;
   bandit->last_mix_p_used = bandit->mix_p;
@@ -2812,7 +2851,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_a6_eta_stats = 0.0;
   bandit->last_a6_eta_model = 0.0;
   bandit->last_a6_pi_eff = 0.0;
-  bandit->last_a6_ips_w = 1.0;
+  bandit->last_a6_sharing_w = 1.0;
   bandit->last_a6_eff_arm = BANDIT_ARM_A6;
   bandit->last_mix_p_used = bandit->mix_p;
   bandit->last_mix_p_next = bandit->mix_p;
@@ -2891,26 +2930,33 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
 #endif
     bandit->last_mix_p_next = bandit->mix_p;
 
+    /* A6 delegated-sample sharing: only the delegated base arm receives the
+       extra clipped inverse-probability-style credit, and no unexecuted arm
+       receives synthetic reward. */
     double pi = bandit->a6_choice_pi;
     if (!isfinite(pi) || pi <= 0.0) {
       pi = 1.0 / (double)ADARARE_A6_TOPK;
     }
-    if (!isfinite(pi) || pi < ADARARE_IPS_PI_EPS) pi = ADARARE_IPS_PI_EPS;
+    if (!isfinite(pi) || pi < ADARARE_DELEGATED_SHARING_PI_EPS) {
+      pi = ADARARE_DELEGATED_SHARING_PI_EPS;
+    }
     if (pi > 1.0) pi = 1.0;
     bandit->last_a6_pi_eff = pi;
-    double ips_w = ADARARE_A6_BASE_ETA;
-    if (bandit->a6_offpolicy_mode != BANDIT_A6_OFFPOLICY_FIXED) {
-      ips_w = 1.0 / pi;
-      if (!isfinite(ips_w) || ips_w < 1.0) ips_w = 1.0;
-      if (bandit->a6_offpolicy_mode == BANDIT_A6_OFFPOLICY_CLIPPED_IPS &&
-          ips_w > ADARARE_IPS_CLIP) {
-        ips_w = ADARARE_IPS_CLIP;
+    double sharing_w = ADARARE_A6_BASE_ETA;
+    if (bandit->a6_sharing_mode != BANDIT_A6_SHARING_FIXED) {
+      sharing_w = 1.0 / pi;
+      if (!isfinite(sharing_w) || sharing_w < 1.0) sharing_w = 1.0;
+      if (bandit->a6_sharing_mode == BANDIT_A6_SHARING_CLIPPED_DELEGATED &&
+          sharing_w > ADARARE_DELEGATED_SHARING_CLIP) {
+        sharing_w = ADARARE_DELEGATED_SHARING_CLIP;
       }
     }
-    if (!isfinite(ips_w) || ips_w <= 0.0) ips_w = ADARARE_A6_BASE_ETA;
-    bandit->last_a6_ips_w = ips_w;
+    if (!isfinite(sharing_w) || sharing_w <= 0.0) {
+      sharing_w = ADARARE_A6_BASE_ETA;
+    }
+    bandit->last_a6_sharing_w = sharing_w;
 
-    double eta = ips_w;
+    double eta = sharing_w;
     bandit->last_a6_eta_eff = eta;
     bandit->last_a6_eta_stats = eta;
     bandit->last_a6_eta_model = eta;
@@ -3712,7 +3758,8 @@ void bandit_log_window(afl_state_t *afl) {
             "dwell_windows,dwell_blocked,guard_arm,guard_penalty,guard_streak,zp_streak,zp_factor,zp_applied,dict_prob,"
             "x_vc,x_vr,x_thrpt,x_q,x_pf,x_pto,ucb_score,base_raw,"
             "alpha,use_contextual,gate_mult,gate_cap,revisit_cooldown_ms,rarity_decay,"
-            "rarity_ema,mix_p,a6_k0,a6_k1,a6_k2,a6_p0,a6_p1,a6_p2,a6_choice,a6_to_a1,a6_to_a2,a6_q1,a6_q2,a6_pi,a6_eta_eff,"
+            "rarity_ema,mix_p,a6_sharing_mode,legacy_a6_offpolicy_mode,delegated_sharing_clip,delegated_sharing_pi_eps,"
+            "a6_k0,a6_k1,a6_k2,a6_p0,a6_p1,a6_p2,a6_choice,a6_to_a1,a6_to_a2,a6_q1,a6_q2,a6_pi,a6_eta_eff,"
             "dict_attempts,dict_taken,dict_attempts_total,"
             "dict_taken_total,dict_enable,dict_baseline_prob,reward_alpha,"
             "reward_beta,reward_gamma,reward_c1,reward_c2,p90_valid,p90_n,"
@@ -3723,7 +3770,7 @@ void bandit_log_window(afl_state_t *afl) {
             "raw_x0,raw_x1,raw_x2,raw_x3,raw_x4,raw_x5,x0,x1,x2,x3,x4,x5,gate_bonus_eff,"
             "raw_reward_pre_cap,a6_pi_floor,dwell_emergency_zero,p90_add_edges,p90_add_rarity,discount,dyn_stag_thresh,"
             "in_warmup,warmup_target,warmup_min_pulls,gate_progress_gated,gate_bonus_headroom,gate_bonus_inject,tie_det_win,tie_det_total,tie_eps,"
-            "a6_ips_w,a6_eff_arm,mix_p_used,mix_p_next,a6_sub_progress_ema,a6_sub_samples,"
+            "a6_sharing_weight,legacy_a6_ips_w,a6_eff_arm,mix_p_used,mix_p_next,a6_sub_progress_ema,a6_sub_samples,"
             "reward_delta,scale_c3_used,p90_cmplog,cmplog_inject_count,cmplog_inject_sum,"
             "cmp_min_gain,cmp_win_clip,cmplog_inject_clipped_count,"
             "cmp_reward,cmp_producer_mode,cmp_a3_boost,cmplog_mod,cmp_rarity_lambda,"
@@ -3734,6 +3781,10 @@ void bandit_log_window(afl_state_t *afl) {
   u64 queued_paths = afl->queued_items;
   double favored_ratio = queued_paths ? ((double)afl->queued_favored / (double)queued_paths) : 0.0;
   const char *adarare_build_id = adarare_build_id_effective();
+  const char *a6_sharing_mode_label =
+      bandit_a6_sharing_mode_label((u8)b->a6_sharing_mode);
+  const char *a6_legacy_mode_label =
+      bandit_a6_sharing_mode_legacy_label((u8)b->a6_sharing_mode);
   
   u64 ts_ms = bandit_now_ms();
 
@@ -3745,13 +3796,13 @@ void bandit_log_window(afl_state_t *afl) {
           "%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%u,%u,%u,%u,%u,%u,%u,%u,%0.6f,%u,%u,%0.6f,%u,%u,"
           "%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,"
           "%0.6f,%0.6f,"
-          "%0.4f,%u,%0.4f,%0.4f,%llu,%0.4f,%0.4f,%0.4f,%u,%u,%u,%0.6f,%0.6f,%0.6f,%u,%llu,%llu,"
+          "%0.4f,%u,%0.4f,%0.4f,%llu,%0.4f,%0.4f,%0.4f,%s,%s,%0.6f,%0.6f,%u,%u,%u,%0.6f,%0.6f,%0.6f,%u,%llu,%llu,"
           "%0.6f,%0.6f,%0.6f,%0.6f,%llu,%llu,%llu,%llu,%u,%u,"
           "%0.4f,%0.4f,%0.4f,%0.4f,%0.4f,%u,%llu,"
           "%llu,%llu,%llu,%llu,%llu,%llu,"
           "%llu,%0.4f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%llu,%llu,%0.6f,%0.6f,%u,%s,"
           "%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,%0.6f,"
-          "%0.6f,%0.6f,%u,%u,%u,%0.6f,%u,%u,%0.6f,%0.6f,%u,%0.6f,%0.6f,%llu,%llu,%0.6f,%0.6f,%u,%0.6f,%0.6f,%0.6f,%llu,%0.6f,%0.6f,%0.6f,%llu,%0.6f,%0.6f,%0.6f,%llu,%u,%u,%u,%0.6f,%0.6f",
+          "%0.6f,%0.6f,%u,%u,%u,%0.6f,%u,%u,%0.6f,%0.6f,%u,%0.6f,%0.6f,%llu,%llu,%0.6f,%0.6f,%0.6f,%u,%0.6f,%0.6f,%0.6f,%llu,%0.6f,%0.6f,%0.6f,%llu,%0.6f,%0.6f,%0.6f,%llu,%u,%u,%u,%0.6f,%0.6f",
           (unsigned long long)ts_ms, b->last_arm_used,
           bandit_arm_label(b->last_arm_used), b->last_arm_eff_used,
           b->last_mix_choice,
@@ -3774,7 +3825,9 @@ void bandit_log_window(afl_state_t *afl) {
           b->last_ucb_score, b->last_base_raw,
           b->alpha, (unsigned int)b->use_contextual, b->gate_multiplier,
           b->gate_cap, (unsigned long long)b->revisit_time_ms,
-          b->rarity_decay, b->rarity_ema, b->mix_p,
+          b->rarity_decay, b->rarity_ema, b->mix_p, a6_sharing_mode_label,
+          a6_legacy_mode_label, ADARARE_DELEGATED_SHARING_CLIP,
+          ADARARE_DELEGATED_SHARING_PI_EPS,
           b->a6_topk[0], b->a6_topk[1], b->a6_topk[2], b->a6_topk_prob[0],
           b->a6_topk_prob[1], b->a6_topk_prob[2], b->last_a6_choice,
           (unsigned long long)b->a6_to_a1, (unsigned long long)b->a6_to_a2,
@@ -3812,7 +3865,8 @@ void bandit_log_window(afl_state_t *afl) {
           b->last_gate_bonus_headroom, b->last_gate_bonus_inject,
           (unsigned long long)b->tie_break_det_hits_win,
           (unsigned long long)b->tie_break_det_hits_total, b->last_tie_eps,
-          b->last_a6_ips_w, b->last_a6_eff_arm, b->last_mix_p_used,
+          b->last_a6_sharing_w, b->last_a6_sharing_w, b->last_a6_eff_arm,
+          b->last_mix_p_used,
           b->last_mix_p_next, b->a6_sub_progress_ema,
           (unsigned long long)b->a6_sub_samples, b->last_reward_delta_used,
           b->last_scale_c3_used, b->last_p90_cmplog,
@@ -3948,8 +4002,10 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
   const char *build_id = afl->build_id[0] ? (const char *)afl->build_id : "unknown";
   const char *adarare_build_id = adarare_build_id_effective();
   const char *adarare_git_commit = adarare_git_commit_effective(afl);
-  const char *a6_offpolicy_mode_label =
-      bandit_a6_offpolicy_mode_label((u8)b->a6_offpolicy_mode);
+  const char *a6_sharing_mode_label =
+      bandit_a6_sharing_mode_label((u8)b->a6_sharing_mode);
+  const char *a6_legacy_mode_label =
+      bandit_a6_sharing_mode_legacy_label((u8)b->a6_sharing_mode);
   u8 per_arm_w_delta_active = 0;
   for (u32 arm = 0; arm < AFL_BANDIT_MAX_ARMS; ++arm) {
     const bandit_arm_cfg_t *cfg = bandit_arm_cfg_for_arm(arm);
@@ -3977,17 +4033,30 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           "  \"rarity_decay\": %.4f,\n"
           "  \"rarity_ema\": %.4f,\n"
           "  \"mix_p\": %.4f,\n"
-          "  \"a6_offpolicy_mode\": ",
+          "  \"sharing_mode\": ",
           b->enabled, (unsigned long long)b->window_ms,
           bandit_profile_policy_label(b), b->num_arms,
           b->use_contextual, (unsigned int)getpid(), b->alpha, b->ridge_lambda, b->gate_multiplier,
           b->gate_cap, (unsigned long long)b->revisit_time_ms,
           b->rarity_decay, b->rarity_ema, b->mix_p);
-  json_print_escaped(fp, a6_offpolicy_mode_label);
+  json_print_escaped(fp, a6_sharing_mode_label);
   fprintf(fp,
           ",\n"
+          "  \"a6_sharing_mode\": "
+  );
+  json_print_escaped(fp, a6_sharing_mode_label);
+  fprintf(fp,
+          ",\n"
+          "  \"legacy_a6_offpolicy_mode\": "
+  );
+  json_print_escaped(fp, a6_legacy_mode_label);
+  fprintf(fp,
+          ",\n"
+          "  \"delegated_sharing_clip\": %.6f,\n"
+          "  \"delegated_sharing_pi_eps\": %.6f,\n"
           "  \"a6_pi\": %.6f,\n"
-          "  \"a6_ips_w\": %.6f,\n"
+          "  \"a6_sharing_weight\": %.6f,\n"
+          "  \"legacy_a6_ips_w\": %.6f,\n"
           "  \"a6_eff_arm\": %u,\n"
           "  \"mix_p_used\": %.6f,\n"
           "  \"mix_p_next\": %.6f,\n"
@@ -4024,7 +4093,9 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           "  \"p90_min_samples\": %u,\n"
           "  \"overhead_timing_enabled\": true,\n"
           "  \"log_path\": ",
-          b->last_a6_pi_eff, b->last_a6_ips_w, b->last_a6_eff_arm,
+          ADARARE_DELEGATED_SHARING_CLIP, ADARARE_DELEGATED_SHARING_PI_EPS,
+          b->last_a6_pi_eff, b->last_a6_sharing_w, b->last_a6_sharing_w,
+          b->last_a6_eff_arm,
           b->last_mix_p_used, b->last_mix_p_next, b->a6_sub_progress_ema,
           (unsigned long long)b->a6_sub_samples, b->dict_enable,
           b->dict_baseline_prob, (unsigned int)per_arm_w_delta_active,
