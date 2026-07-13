@@ -156,6 +156,11 @@
 #include <ctype.h>
 #include <limits.h>
 #include <time.h>
+
+static inline const char *bandit_profile_policy_label(
+    const bandit_state_t *bandit);
+static inline const char *bandit_context_mode_label(
+    const bandit_state_t *bandit);
 #ifndef __HAIKU__
   #include <sys/resource.h>
 #endif
@@ -690,11 +695,22 @@ static inline double bandit_arm_mean_reward(const bandit_arm_state_t *arm) {
 
 }
 
+static inline u32 bandit_selection_arm_count(const bandit_state_t *bandit) {
+
+  if (!bandit || !bandit->num_arms) { return 0; }
+  u32 count = bandit->num_arms;
+  if (!bandit->enable_a6 && count > (u32)BANDIT_ARM_A6) {
+    count = (u32)BANDIT_ARM_A6;
+  }
+  return count > AFL_BANDIT_MAX_ARMS ? AFL_BANDIT_MAX_ARMS : count;
+
+}
+
 static inline double bandit_min_warmup_pulls(const bandit_state_t *bandit) {
 
   if (!bandit || !bandit->arms || !bandit->num_arms) { return 0.0; }
   double min_pulls = DBL_MAX;
-  for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
+  for (u32 i = 0; i < bandit_selection_arm_count(bandit); ++i) {
     double pulls = bandit->arms[i].warmup_pulls;
     if (!isfinite(pulls) || pulls < 0.0) pulls = 0.0;
     if (pulls < min_pulls) min_pulls = pulls;
@@ -708,7 +724,7 @@ static inline u8 bandit_in_pulls_warmup(const bandit_state_t *bandit) {
   if (!bandit || !bandit->arms) { return 0; }
   double target = bandit->warmup_pulls_target;
   if (!isfinite(target) || target <= BANDIT_PULLS_EPSILON) { return 0; }
-  for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
+  for (u32 i = 0; i < bandit_selection_arm_count(bandit); ++i) {
     if (bandit->arms[i].warmup_pulls + BANDIT_PULLS_EPSILON < target) {
       return 1;
     }
@@ -722,7 +738,7 @@ static inline u32 bandit_argmin_pulls(const bandit_state_t *bandit) {
   if (!bandit || !bandit->arms || !bandit->num_arms) { return 0; }
   u32 best_arm = 0;
   double best_pulls = DBL_MAX;
-  for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
+  for (u32 i = 0; i < bandit_selection_arm_count(bandit); ++i) {
     double pulls = bandit->arms[i].warmup_pulls;
     if (!isfinite(pulls) || pulls < 0.0) pulls = 0.0;
     if (pulls + BANDIT_PULLS_EPSILON < best_pulls ||
@@ -743,7 +759,8 @@ static inline u32 bandit_pick_revisit_arm(const bandit_state_t *bandit) {
   u32 best_arm = bandit->current_arm;
   double best_mean = -DBL_MAX;
   u8 found_non_current = 0;
-  for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
+  u32 arm_count = bandit_selection_arm_count(bandit);
+  for (u32 i = 0; i < arm_count; ++i) {
     if (i == bandit->current_arm) { continue; }
     double mean = bandit_arm_mean_reward(&bandit->arms[i]);
     if (mean > best_mean) {
@@ -757,7 +774,7 @@ static inline u32 bandit_pick_revisit_arm(const bandit_state_t *bandit) {
 
   best_arm = 0;
   best_mean = -DBL_MAX;
-  for (u32 i = 0; i < bandit->num_arms && i < AFL_BANDIT_MAX_ARMS; ++i) {
+  for (u32 i = 0; i < arm_count; ++i) {
     double mean = bandit_arm_mean_reward(&bandit->arms[i]);
     if (mean > best_mean) {
       best_mean = mean;
@@ -925,7 +942,8 @@ static void bandit_dbg_log_window(
   }
 
   fprintf(dbg_out,
-          "[bandit dbg] now_ms=%llu window_ms=%llu arm_cur=%u arm_next=%u "
+          "[bandit dbg] policy=%s enable_a6=%u context_mode=%s "
+          "now_ms=%llu window_ms=%llu arm_cur=%u arm_next=%u "
           "arm_eff=%u warmup=%u stag_windows=%u dyn_stag_thresh=%u trend_stag=%u "
           "warmup_target=%.4f warmup_min=%.4f discount=%.6f "
           "slope_r=%.6f slope_e=%.6f stag_bonus_boost=%u forced_revisit=%u "
@@ -933,6 +951,8 @@ static void bandit_dbg_log_window(
           "clamp_hi=%u guard_hits=%u tie_win=%u tie_total=%llu "
           "tie_det_win=%llu tie_det_total=%llu tie_eps=%.6f reward_zero=%u "
           "dwell_windows=%u dwell_blocked=%u dwell_emergency_zero=%u\n",
+          bandit_profile_policy_label(bandit), (unsigned)bandit->enable_a6,
+          bandit_context_mode_label(bandit),
           (unsigned long long)now_ms, (unsigned long long)cur_window_ms,
           arm_cur, arm_next, bandit->current_arm_eff, (unsigned)bandit->in_warmup,
           bandit->stagnation_windows, bandit->last_dyn_stag_thresh,
@@ -1101,6 +1121,15 @@ static inline u8 bandit_profile_policy_is_linucb(
 
 }
 
+static inline const char *bandit_context_mode_label(
+    const bandit_state_t *bandit) {
+
+  return bandit && bandit->context_mode == BANDIT_CONTEXT_CONSTANT
+             ? "constant"
+             : "dynamic";
+
+}
+
 static inline bandit_policy_t bandit_parse_profile_policy(void) {
 
   char *val = getenv("AFL_ADARARE_POLICY");
@@ -1134,7 +1163,49 @@ static inline bandit_policy_t bandit_parse_profile_policy(void) {
     return BANDIT_POLICY_STATIC_PROFILE;
   }
 
-  return BANDIT_POLICY_LINUCB;
+  FATAL("Invalid AFL_ADARARE_POLICY=%s; expected linucb, random_profile, "
+        "round_robin_profile, or static_profile",
+        val);
+
+}
+
+static inline u8 bandit_parse_enable_a6(void) {
+
+  char *val = getenv("AFL_ADARARE_ENABLE_A6");
+  if (!val || !val[0]) { return 1; }
+  if (!strcmp(val, "0")) { return 0; }
+  if (!strcmp(val, "1")) { return 1; }
+  FATAL("Invalid AFL_ADARARE_ENABLE_A6=%s; expected 0 or 1", val);
+
+}
+
+static inline bandit_context_mode_t bandit_parse_context_mode(void) {
+
+  char *val = getenv("AFL_ADARARE_CONTEXT_MODE");
+  if (!val || !val[0]) { return BANDIT_CONTEXT_DYNAMIC; }
+
+  char norm[32];
+  size_t i = 0;
+  while (val[i] && i + 1 < sizeof(norm)) {
+    norm[i] = (char)tolower((unsigned char)val[i]);
+    i++;
+  }
+  norm[i] = '\0';
+
+  if (!strcmp(norm, "dynamic")) { return BANDIT_CONTEXT_DYNAMIC; }
+  if (!strcmp(norm, "constant")) { return BANDIT_CONTEXT_CONSTANT; }
+  FATAL("Invalid AFL_ADARARE_CONTEXT_MODE=%s; expected dynamic or constant",
+        val);
+
+}
+
+static inline void bandit_validate_batch_a_config(
+    bandit_policy_t policy, u8 enable_a6) {
+
+  if (policy != BANDIT_POLICY_LINUCB && enable_a6) {
+    FATAL("AFL_ADARARE_POLICY=%s requires AFL_ADARARE_ENABLE_A6=0",
+          bandit_profile_policy_label_enum(policy));
+  }
 
 }
 
@@ -1575,7 +1646,10 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
   bandit->dwell_windows = 0;
   bandit->last_selected_arm = 0;
   bandit->profile_policy = bandit_parse_profile_policy();
+  bandit->enable_a6 = bandit_parse_enable_a6();
+  bandit->context_mode = bandit_parse_context_mode();
   bandit->static_arm = bandit_parse_static_profile_arm(bandit->profile_policy);
+  bandit_validate_batch_a_config(bandit->profile_policy, bandit->enable_a6);
   bandit->rng_state = 0;
   bandit->profile_policy_rng_state = 0;
   bandit->verify_enabled =
@@ -1825,13 +1899,16 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
             "[adarare] build_id=%s warmup_pulls=%.3f progress_gate=1 "
             "gate_headroom=1 tie_break=deterministic tie_eps_rel=%.6f "
             "cmp_reward=%u cmp_mode=%u a3_cmp_boost=%u delta=%.3f c3=%.3f "
-            "cmp_baseline_norm=%u cmp_baseline_ema=%.3f policy=%s\n",
+            "cmp_baseline_norm=%u cmp_baseline_ema=%.3f policy=%s "
+            "enable_a6=%u context_mode=%s\n",
             build_id, bandit->warmup_pulls_target, ADARARE_TIE_EPS_REL,
             (unsigned int)bandit->cmp_reward,
             (unsigned int)bandit->cmp_producer_mode,
             (unsigned int)bandit->cmp_a3_boost, bandit->reward_delta,
             bandit->reward_c3, (unsigned int)bandit->cmp_baseline_norm,
-            bandit->cmp_baseline_ema, bandit_profile_policy_label(bandit));
+            bandit->cmp_baseline_ema, bandit_profile_policy_label(bandit),
+            (unsigned int)bandit->enable_a6,
+            bandit_context_mode_label(bandit));
     bandit_build_id_logged = 1;
   }
 #endif
@@ -1877,7 +1954,7 @@ void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms) {
     reservoir_reset(&((bandit_reservoir_t *)bandit->cmplog_rate_res)[i]);
   }
 
-  if (bandit_profile_policy_is_linucb(bandit)) {
+  if (bandit_profile_policy_is_linucb(bandit) && bandit->enable_a6) {
     bandit_build_a6_topk(bandit);
   }
 }
@@ -2811,7 +2888,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
 
   u32 next_arm = bandit->current_arm;
   u8 linucb_policy = bandit_profile_policy_is_linucb(bandit);
-  if (linucb_policy) {
+  if (linucb_policy && bandit->enable_a6) {
     bandit_build_a6_topk(bandit);
   }
   
@@ -2841,6 +2918,11 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   raw_x[3] = bandit_clamp_feature(log1p(q_rel) * BANDIT_X3_SCALE);
   raw_x[4] = bandit_clamp_feature(favored_ratio * BANDIT_X4_SCALE);
   raw_x[5] = bandit_clamp_feature(log1p(p_timeout) * BANDIT_X5_SCALE);
+  if (bandit->context_mode == BANDIT_CONTEXT_CONSTANT) {
+    for (int k = 0; k < BANDIT_CTX_DIM; ++k) {
+      raw_x[k] = (k == 0) ? 1.0 : 0.0;
+    }
+  }
   for (int k = 0; k < BANDIT_CTX_DIM; ++k) {
     if (!isfinite(raw_x[k])) raw_x[k] = 0.0;
     bandit->last_raw_x[k] = raw_x[k];
@@ -2892,7 +2974,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   bandit->last_a6_eff_arm = BANDIT_ARM_A6;
   bandit->last_mix_p_used = bandit->mix_p;
   bandit->last_mix_p_next = bandit->mix_p;
-  if (linucb_policy &&
+  if (linucb_policy && bandit->enable_a6 &&
       bandit->current_arm == BANDIT_ARM_A6 && window_arm_eff < bandit->num_arms &&
       window_arm_eff != bandit->current_arm) {
 
@@ -3095,7 +3177,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
     stag_bonus_boost = (stagnation_bonus_mul > 1.0 + BANDIT_PULLS_EPSILON) ? 1 : 0;
     bandit->last_stag_bonus_boost = stag_bonus_boost;
 
-    for (u32 i = 0; i < bandit->num_arms; ++i) {
+    u32 arm_count = bandit_selection_arm_count(bandit);
+    for (u32 i = 0; i < arm_count; ++i) {
       double score = 0.0;
       double pred = 0.0;
       double bonus = 0.0;
@@ -3378,7 +3461,7 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
   u8 next_mix_choice = 0;
   u32 next_arm_eff_candidate = next_arm;
   double next_a6_pi = 0.0;
-  if (linucb_policy && next_arm == BANDIT_ARM_A6) {
+  if (linucb_policy && bandit->enable_a6 && next_arm == BANDIT_ARM_A6) {
     u32 chosen = bandit->a6_topk[0];
     double chosen_prob = bandit->a6_topk_prob[0];
     double pick = (double)bandit_get_random(bandit) / 4294967296.0;
@@ -3561,7 +3644,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
       
       fprintf(bandit->verify_fp,
               "win_id=%llu entry_now_ms=%llu new_start_ms=%llu win_actual_len=%llu "
-              "window_ms=%llu policy=%s logic_shift_ms=%llu rotate_us=%llu rng_seeded_owner=%u "
+              "window_ms=%llu policy=%s enable_a6=%u context_mode=%s "
+              "logic_shift_ms=%llu rotate_us=%llu rng_seeded_owner=%u "
               "rng_state=0x%llx rng_log_n=%u arm_prev=%u arm_next=%u "
               "inv_fail_win=%llu rad_cap_win=%llu score_cap_win=%llu\n",
               (unsigned long long)win_id, /* Explicit Window ID */
@@ -3570,6 +3654,8 @@ u8 bandit_maybe_rotate(bandit_state_t *bandit) {
               (unsigned long long)win_actual_len, /* Checked Delta */
               (unsigned long long)bandit->window_ms,
               bandit_profile_policy_label(bandit),
+              (unsigned int)bandit->enable_a6,
+              bandit_context_mode_label(bandit),
               (unsigned long long)logic_shift_ms, /* Checked Shift */
               (unsigned long long)bandit->last_rotate_us, /* Added rotate_us */
               bandit->rng_seeded_from_owner,
@@ -3811,7 +3897,7 @@ void bandit_log_window(afl_state_t *afl) {
             "reward_delta,scale_c3_used,p90_cmplog,cmplog_inject_count,cmplog_inject_sum,"
             "cmp_min_gain,cmp_win_clip,cmplog_inject_clipped_count,"
             "cmp_reward,cmp_producer_mode,cmp_a3_boost,cmplog_mod,cmp_rarity_lambda,"
-            "cmplog_rate_ema,cmplog_rate_norm,static_arm,policy\n");
+            "cmplog_rate_ema,cmplog_rate_norm,enable_a6,context_mode,static_arm,policy\n");
     b->log_header_written = 1;
   }
 
@@ -3918,8 +4004,9 @@ void bandit_log_window(afl_state_t *afl) {
       (b->profile_policy == BANDIT_POLICY_STATIC_PROFILE)
           ? (int)b->static_arm + 1
           : 0;
-  fprintf(b->log_fp, ",%0.6f,%0.6f,%d,%s\n", b->cmplog_rate_ema,
-          b->last_cmplog_rate_norm, static_arm_out,
+  fprintf(b->log_fp, ",%0.6f,%0.6f,%u,%s,%d,%s\n", b->cmplog_rate_ema,
+          b->last_cmplog_rate_norm, (unsigned int)b->enable_a6,
+          bandit_context_mode_label(b), static_arm_out,
           bandit_profile_policy_label(b));
 
   fflush(b->log_fp);
@@ -3963,7 +4050,7 @@ static void adarare_log_overhead_window(
             "total_execs,execs_per_sec,rss_mb,log_bytes_written,"
             "context_build_us,reward_build_us,linucb_score_us,model_update_us,"
             "profile_apply_us,controller_compute_us,log_write_us,"
-            "total_window_boundary_us,static_arm,policy\n");
+            "total_window_boundary_us,enable_a6,context_mode,static_arm,policy\n");
     b->overhead_header_written = 1;
   }
 
@@ -3979,7 +4066,7 @@ static void adarare_log_overhead_window(
 
   fprintf(b->overhead_fp,
           "%llu,%llu,%lld,%lld,%llu,%llu,%lld,%s,%s,%lld,%0.6f,%lld,%lld,"
-          "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d,%s\n",
+          "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%s,%d,%s\n",
           (unsigned long long)window_id,
           (unsigned long long)adarare_now_us(), (long long)selected_out,
           (long long)effective_out, (unsigned long long)cur_window_ms,
@@ -3995,6 +4082,8 @@ static void adarare_log_overhead_window(
           (unsigned long long)controller_compute_us,
           (unsigned long long)log_write_us,
           (unsigned long long)total_window_boundary_us,
+          (unsigned int)b->enable_a6,
+          bandit_context_mode_label(b),
           (b->profile_policy == BANDIT_POLICY_STATIC_PROFILE)
               ? (int)b->static_arm + 1
               : 0,
@@ -4066,9 +4155,12 @@ void adarare_write_config_snapshot(afl_state_t *afl) {
           "  \"enabled\": %u,\n"
           "  \"window_ms\": %llu,\n"
           "  \"policy\": \"%s\",\n"
+          "  \"enable_a6\": %u,\n"
+          "  \"context_mode\": \"%s\",\n"
           "  \"static_arm\": ",
           b->enabled, (unsigned long long)b->window_ms,
-          bandit_profile_policy_label(b));
+          bandit_profile_policy_label(b), (unsigned int)b->enable_a6,
+          bandit_context_mode_label(b));
   if (b->profile_policy == BANDIT_POLICY_STATIC_PROFILE) {
     fprintf(fp, "%u", b->static_arm + 1);
   } else {

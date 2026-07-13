@@ -73,7 +73,9 @@ Configuration is handled via environment variables.
 | `AFL_BANDIT_WINDOW_MS` | 5000 | Duration of one decision window (ms). |
 | `AFL_BANDIT_REWARD` | `novelty` | Reward source. Use `rarity_mass` for rarity-mass experiments. |
 | `AFL_BANDIT_REWARD_FORMULA` | `rate_cost` | Reward formula. Supported values are `rate` and `rate_cost`. |
-| `AFL_ADARARE_POLICY` | `linucb` | Scheduler policy. Supported values are `linucb`, `random_profile`, `round_robin_profile`, and `static_profile`. Profile-control policies select only A1-A5 and do not select A6. |
+| `AFL_ADARARE_POLICY` | `linucb` | Scheduler policy. Supported values are `linucb`, `random_profile`, `round_robin_profile`, and `static_profile`. Unknown values fail fast. |
+| `AFL_ADARARE_ENABLE_A6` | `1` | Enable A6 for LinUCB. The random, round-robin, and static controls require `0`; LinUCB with `0` selects only A1-A5. |
+| `AFL_ADARARE_CONTEXT_MODE` | `dynamic` | LinUCB context mode. `constant` keeps the same 6D score/update path but replaces the context with `[1,0,0,0,0,0]`. |
 | `AFL_ADARARE_STATIC_ARM` | unset | Required when `AFL_ADARARE_POLICY=static_profile`. Values `1` through `5` pin the fixed profile arm A1 through A5; missing or out-of-range values fail fast. |
 | `AFL_ADARARE_ALPHA` | 0.6 | LinUCB exploration parameter. Higher = more exploration. |
 | `AFL_ADARARE_RIDGE` | 10.0 | Ridge regression lambda (regularization). Values below 1.0 are clamped. |

@@ -65,6 +65,11 @@ typedef enum {
   BANDIT_POLICY_STATIC_PROFILE
 } bandit_policy_t;
 
+typedef enum {
+  BANDIT_CONTEXT_DYNAMIC = 0,
+  BANDIT_CONTEXT_CONSTANT
+} bandit_context_mode_t;
+
 typedef struct bandit_arm_state {
 
   double pulls;        /* Discounted execution weight for UCB. */
@@ -93,6 +98,8 @@ typedef struct bandit_state {
   u64 rng_state; /* Decoupled RNG for bandit decisions */
   bandit_policy_t profile_policy;
   u64 profile_policy_rng_state;
+  u8 enable_a6;
+  bandit_context_mode_t context_mode;
   u32 static_arm; /* Zero-based fixed profile arm for static_profile. */
   u32 num_arms;
   u32 current_arm;
