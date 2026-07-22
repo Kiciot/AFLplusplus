@@ -175,6 +175,11 @@ endif
 override CFLAGS += -g -Wno-pointer-sign -Wno-variadic-macros -Wall -Wextra -Wno-pointer-arith \
 			-fPIC -I include/ -DAFL_PATH=\"$(HELPER_PATH)\"  \
 			-DBIN_PATH=\"$(BIN_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\"
+
+# Embed the source checkout used for the runtime evidence sidecar. A caller
+# may override this when building from an archive without a .git directory.
+ADARARE_GIT_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+override CFLAGS += -DADARARE_GIT_COMMIT=\"$(ADARARE_GIT_COMMIT)\"
 # -fstack-protector
 
 ifeq "$(SYS)" "FreeBSD"

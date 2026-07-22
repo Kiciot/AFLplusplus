@@ -259,7 +259,7 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 
   u8 need_path_len = afl->bandit.enabled &&
                      (afl->bandit_gate == BANDIT_GATE_PATH_LEN ||
-                      (afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS &&
+                      (bandit_rarity_logic_enabled(&afl->bandit) &&
                        afl->bandit.rarity_norm == BANDIT_RARITY_NORM_PATH_LEN));
 
   for (u32 idx = 0; idx < i; ++idx) {
@@ -279,8 +279,7 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 
       }
 
-      if (afl->bandit.enabled &&
-          afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS &&
+      if (afl->bandit.enabled && bandit_rarity_logic_enabled(&afl->bandit) &&
           afl->edge_hit) {
 
         const u8 *cur_bytes = (const u8 *)&cur_word;
@@ -426,28 +425,30 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 
   }
 
-  if (afl->bandit.enabled &&
-      afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS) {
+  if (afl->bandit.enabled && bandit_rarity_logic_enabled(&afl->bandit)) {
 
-    double seed_inc = rarity_mass;
-    if (afl->bandit.rarity_norm == BANDIT_RARITY_NORM_PATH_LEN) {
-      double denom = (double)(path_len ? path_len : 1);
-      seed_inc = rarity_mass / denom;
-    }
-    if (afl->queue_cur) {
-      double obs = seed_inc;
-      if (!isfinite(obs) || obs < 0.0) obs = 0.0;
-      if (obs > AFL_ADARARE_RARITY_MAX) obs = AFL_ADARARE_RARITY_MAX;
-      double ema = afl->bandit.enabled ? afl->bandit.rarity_ema : 1.0;
-      if (ema < 0.05) ema = 0.05;
-      if (ema > 1.0) ema = 1.0;
-      double old = afl->queue_cur->rarity_score;
-      if (!isfinite(old) || old < 0.0) old = 0.0;
-      if (old > AFL_ADARARE_RARITY_MAX) old = AFL_ADARARE_RARITY_MAX;
-      double newv = ema * obs + (1.0 - ema) * old;
-      if (!isfinite(newv) || newv < 0.0) newv = 0.0;
-      if (newv > AFL_ADARARE_RARITY_MAX) newv = AFL_ADARARE_RARITY_MAX;
-      afl->queue_cur->rarity_score = newv;
+    if (afl->bandit.rarity_reward_enabled &&
+        afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS) {
+      double seed_inc = rarity_mass;
+      if (afl->bandit.rarity_norm == BANDIT_RARITY_NORM_PATH_LEN) {
+        double denom = (double)(path_len ? path_len : 1);
+        seed_inc = rarity_mass / denom;
+      }
+      if (afl->queue_cur) {
+        double obs = seed_inc;
+        if (!isfinite(obs) || obs < 0.0) obs = 0.0;
+        if (obs > AFL_ADARARE_RARITY_MAX) obs = AFL_ADARARE_RARITY_MAX;
+        double ema = afl->bandit.rarity_ema;
+        if (ema < 0.05) ema = 0.05;
+        if (ema > 1.0) ema = 1.0;
+        double old = afl->queue_cur->rarity_score;
+        if (!isfinite(old) || old < 0.0) old = 0.0;
+        if (old > AFL_ADARARE_RARITY_MAX) old = AFL_ADARARE_RARITY_MAX;
+        double newv = ema * obs + (1.0 - ema) * old;
+        if (!isfinite(newv) || newv < 0.0) newv = 0.0;
+        if (newv > AFL_ADARARE_RARITY_MAX) newv = AFL_ADARARE_RARITY_MAX;
+        afl->queue_cur->rarity_score = newv;
+      }
     }
     bandit_on_rarity_mass(&afl->bandit, rarity_mass, path_len);
 
@@ -477,8 +478,7 @@ static inline u8 has_new_bits_unclassified(afl_state_t *afl, u8 *virgin_map,
 
   if (!skim((u64 *)virgin_map, (u64 *)afl->fsrv.trace_bits, (u64 *)end)) {
 
-    if (afl->bandit.enabled &&
-        afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS) {
+    if (afl->bandit.enabled && bandit_rarity_logic_enabled(&afl->bandit)) {
 
       classify_counts(&afl->fsrv);
       *classified = true;
@@ -494,8 +494,7 @@ static inline u8 has_new_bits_unclassified(afl_state_t *afl, u8 *virgin_map,
 
   if (!skim((u32 *)virgin_map, (u32 *)afl->fsrv.trace_bits, (u32 *)end)) {
 
-    if (afl->bandit.enabled &&
-        afl->bandit.reward_mode == BANDIT_REWARD_RARITY_MASS) {
+    if (afl->bandit.enabled && bandit_rarity_logic_enabled(&afl->bandit)) {
 
       classify_counts(&afl->fsrv);
       *classified = true;

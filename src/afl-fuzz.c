@@ -669,6 +669,7 @@ int main(int argc, char **argv_orig, char **envp) {
   afl_fsrv_init(&afl->fsrv);
   if (debug) { afl->fsrv.debug = true; }
   read_afl_environment(afl, envp);
+  bandit_configure_runtime(&afl->bandit);
 
   /* Dict control defaults / env */
   u32 dict_default = AFL_BANDIT_DICT_PROB_DEFAULT;
@@ -688,13 +689,8 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
-  if (afl->afl_env.afl_bandit) {
-
-    const char *bandit_val = (const char *)afl->afl_env.afl_bandit;
-    u8          enable_bandit =
-        !bandit_val[0] || atoi(bandit_val) != 0 ? 1 : 0;
-
-    if (enable_bandit) {
+  if (bandit_runtime_controller_requested(
+          &afl->bandit, afl->afl_env.afl_bandit)) {
 
       u64 window_ms = AFL_BANDIT_DEFAULT_WINDOW_MS;
 
@@ -867,8 +863,6 @@ int main(int argc, char **argv_orig, char **envp) {
           (unsigned long long)afl->bandit.warmup_windows,
           bandit_rarity_norm_label(afl->bandit.rarity_norm));
 
-    }
-
   }
 
   if (afl->bandit.enabled) {
@@ -883,14 +877,6 @@ int main(int argc, char **argv_orig, char **envp) {
         afl->bandit.in_warmup
             ? dict_default
             : bandit_dict_prob_for_arm(afl->bandit.current_arm);
-
-  }
-
-  if (afl->shm.cmplog_mode || afl->cmplog_binary ||
-      getenv("AFL_CMPLOG") || getenv("AFL_LLVM_CMPLOG") ||
-      getenv("AFL_GCC_CMPLOG")) {
-
-    afl->bandit_cmplog_enabled = 1;
 
   }
 
@@ -2054,6 +2040,12 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+  afl->bandit_cmplog_enabled =
+      (afl->shm.cmplog_mode && afl->cmplog_binary &&
+       afl->cmplog_binary[0])
+          ? 1
+          : 0;
+
   if (strchr(argv[optind], '/') == NULL && !afl->unicorn_mode) {
 
     WARNF(cLRD
@@ -2433,6 +2425,7 @@ int main(int argc, char **argv_orig, char **envp) {
   bandit_set_log_dir(&afl->bandit, (const char *)afl->out_dir);
   bandit_set_owner(&afl->bandit, afl);
   adarare_write_config_snapshot(afl);
+  adarare_write_runtime_evidence(afl, 0);
 
   #ifdef HAVE_AFFINITY
   bind_to_free_cpu(afl);
@@ -3950,6 +3943,7 @@ stop_fuzzing:
   afl->force_ui_update = 1;  // ensure the screen is reprinted
   afl->stop_soon = 1;        // ensure everything is written
   show_stats(afl);           // print the screen one last time
+  adarare_write_runtime_evidence(afl, 1);
   write_bitmap(afl);
   save_auto(afl);
 

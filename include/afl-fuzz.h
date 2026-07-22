@@ -659,6 +659,7 @@ typedef struct afl_state {
   u8     bandit_cmplog_enabled;         /* CmpLog observed enabled flag     */
   u64    bandit_win_cmplog_execs;       /* CmpLog execs in current window   */
   u64    bandit_last_cmplog_execs;      /* CmpLog execs in last window      */
+  u64    bandit_cmplog_execs_total;     /* Actual CmpLog child executions  */
   u64    bandit_win_havoc_ops;          /* Havoc ops in current window      */
   u64    bandit_win_dict_ops;           /* Dict ops in current window       */
   u64    bandit_last_havoc_ops;         /* Havoc ops in last window         */

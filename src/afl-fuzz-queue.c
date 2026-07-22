@@ -1483,28 +1483,34 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
 
   /* Bandit energy shaping (temporary z = rarity_score). */
   if (afl->bandit.enabled) {
-    if (afl->bandit.rarity_decay > 0.0 && afl->bandit.rarity_decay < 1.0) {
-      if (q->rarity_score < 0.0 || !isfinite(q->rarity_score)) {
-        q->rarity_score = 0.0;
+    if (afl->bandit.runtime_mode == BANDIT_MODE_ACTIVE &&
+        (!afl->bandit.runtime_mode_explicit ||
+         bandit_rarity_logic_enabled(&afl->bandit))) {
+      if (afl->bandit.rarity_decay > 0.0 && afl->bandit.rarity_decay < 1.0) {
+        if (q->rarity_score < 0.0 || !isfinite(q->rarity_score)) {
+          q->rarity_score = 0.0;
+        }
+        q->rarity_score *= afl->bandit.rarity_decay;
+        if (q->rarity_score < 0.0) q->rarity_score = 0.0;
+        if (q->rarity_score > AFL_ADARARE_RARITY_MAX)
+          q->rarity_score = AFL_ADARARE_RARITY_MAX;
       }
-      q->rarity_score *= afl->bandit.rarity_decay;
+      if (!isfinite(q->rarity_score)) q->rarity_score = 0.0;
       if (q->rarity_score < 0.0) q->rarity_score = 0.0;
       if (q->rarity_score > AFL_ADARARE_RARITY_MAX)
         q->rarity_score = AFL_ADARARE_RARITY_MAX;
+      u32 randv = rand_below(afl, 0xffffffffu);
+      bandit_score_sample_push(&afl->bandit, q->rarity_score, randv);
+      double z =
+          q->rarity_score / (afl->bandit.last_p90_score + 1e-12);
+      double boost = bandit_energy_boost(&afl->bandit, z);
+      double scaled = (double)perf_score * boost;
+      if (scaled < 1.0) scaled = 1.0;
+      perf_score = (u32)scaled;
     }
-    if (!isfinite(q->rarity_score)) q->rarity_score = 0.0;
-    if (q->rarity_score < 0.0) q->rarity_score = 0.0;
-    if (q->rarity_score > AFL_ADARARE_RARITY_MAX)
-      q->rarity_score = AFL_ADARARE_RARITY_MAX;
-    u32 randv = rand_below(afl, 0xffffffffu);
-    bandit_score_sample_push(&afl->bandit, q->rarity_score, randv);
-    double z =
-        q->rarity_score / (afl->bandit.last_p90_score + 1e-12);
-    double boost = bandit_energy_boost(&afl->bandit, z);
-    double scaled = (double)perf_score * boost;
-    if (scaled < 1.0) scaled = 1.0;
-    perf_score = (u32)scaled;
-  } else {
+  } else if (!afl->bandit.runtime_mode_explicit) {
+    /* Preserve the legacy no-mode behavior. Explicit Batch B off leaves the
+       initialized AFL++ default profile untouched. */
     afl->adarare_dict_prob = afl->bandit.dict_baseline_prob;
   }
 

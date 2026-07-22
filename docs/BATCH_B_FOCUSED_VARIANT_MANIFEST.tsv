@@ -1,0 +1,7 @@
+variant	mode	AFL_BANDIT	AFL_BANDIT_WINDOW_MS	AFL_ADARARE_POLICY	AFL_ADARARE_ENABLE_A6	AFL_ADARARE_RARITY_CONTEXT	AFL_ADARARE_RARITY_REWARD	AFL_ADARARE_RARITY_GATE	AFL_ADARARE_TELEMETRY	AFL_ADARARE_AUDIT	cmplog
+batchb_aflpp_default	off	0			0	0	0	0	0	1	no -c
+batchb_aflpp_cmplog_matched	off	0			0	0	0	0	0	1	same -c
+batchb_aflpp_shadow	shadow	1	5000	linucb	0	1	1	1	1	1	same -c
+batchb_adarare_full	active	1	5000	linucb	1	1	1	1	1	1	same -c
+batchb_adarare_no_a6	active	1	5000	linucb	0	1	1	1	1	1	same -c
+batchb_adarare_no_rarity	active	1	5000	linucb	0	0	0	0	1	1	same -c

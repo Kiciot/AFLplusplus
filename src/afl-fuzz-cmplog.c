@@ -257,6 +257,17 @@ u8 common_fuzz_cmplog_stuff(afl_state_t *afl, u8 *out_buf, u32 len) {
 
   fault = fuzz_run_target(afl, &afl->cmplog_fsrv, afl->fsrv.exec_tmout);
 
+  /* This is the actual CmpLog child-execution boundary. Count it before
+     fault/stop handling so timeouts and requested shutdowns are included. */
+  if (afl->bandit_cmplog_enabled && afl->cmplog_binary) {
+
+    if (afl->bandit_cmplog_execs_total < ULLONG_MAX) {
+      afl->bandit_cmplog_execs_total++;
+    }
+    if (afl->bandit.enabled) { afl->bandit_win_cmplog_execs++; }
+
+  }
+
   if (fault == FSRV_RUN_OK) {
 
     double progress = cmplog_post_exec_progress(afl);
@@ -291,8 +302,6 @@ u8 common_fuzz_cmplog_stuff(afl_state_t *afl, u8 *out_buf, u32 len) {
     return 1;
 
   }
-
-  if (afl->bandit.enabled) { afl->bandit_win_cmplog_execs++; }
 
   return 0;
 

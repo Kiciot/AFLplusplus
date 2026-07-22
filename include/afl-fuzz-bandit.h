@@ -70,6 +70,12 @@ typedef enum {
   BANDIT_CONTEXT_CONSTANT
 } bandit_context_mode_t;
 
+typedef enum {
+  BANDIT_MODE_OFF = 0,
+  BANDIT_MODE_SHADOW,
+  BANDIT_MODE_ACTIVE
+} bandit_runtime_mode_t;
+
 typedef struct bandit_arm_state {
 
   double pulls;        /* Discounted execution weight for UCB. */
@@ -95,6 +101,19 @@ typedef struct bandit_state {
 
   u8 enabled;
   struct afl_state *owner;
+  bandit_runtime_mode_t runtime_mode;
+  u8 runtime_mode_explicit;
+  u8 telemetry_enabled;
+  u8 audit_enabled;
+  u8 rarity_context_enabled;
+  u8 rarity_reward_enabled;
+  u8 rarity_gate_enabled;
+  u64 candidate_action_count;
+  u64 applied_action_count;
+  u64 candidate_arm_counts[AFL_BANDIT_MAX_ARMS];
+  u64 applied_arm_counts[AFL_BANDIT_MAX_ARMS];
+  u32 last_candidate_arm;
+  u8 last_action_applied;
   u64 rng_state; /* Decoupled RNG for bandit decisions */
   bandit_policy_t profile_policy;
   u64 profile_policy_rng_state;
@@ -339,6 +358,11 @@ typedef struct bandit_state {
 
 void bandit_init(bandit_state_t *bandit, u32 arms, u64 window_ms);
 void bandit_deinit(bandit_state_t *bandit);
+void bandit_configure_runtime(bandit_state_t *bandit);
+u8 bandit_runtime_controller_requested(const bandit_state_t *bandit,
+                                       const u8 *legacy_bandit_env);
+const char *bandit_runtime_mode_label(const bandit_state_t *bandit);
+u8 bandit_rarity_logic_enabled(const bandit_state_t *bandit);
 void bandit_on_new_cov(bandit_state_t *bandit, u64 new_bits,
                        double novelty_delta, double gate);
 void bandit_on_rarity_mass(bandit_state_t *bandit, double rarity_mass,
@@ -367,5 +391,6 @@ void bandit_log_window(struct afl_state *afl);
 void bandit_set_owner(bandit_state_t *bandit, struct afl_state *afl);
 u32 bandit_current_dict_prob(const bandit_state_t *bandit);
 void adarare_write_config_snapshot(struct afl_state *afl);
+void adarare_write_runtime_evidence(struct afl_state *afl, u8 clean_shutdown);
 
 #endif
